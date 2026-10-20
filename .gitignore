@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+
+# dbt
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+dbt/.user.yml
+
+# Data files (raw downloads, API responses, etc.)
+data/
+
+# DuckDB
+*.duckdb
+*.duckdb.wal
+
+# Secrets
+.env
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+*.iml
