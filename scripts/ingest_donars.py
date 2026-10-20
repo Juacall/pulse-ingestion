@@ -4,11 +4,15 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from pathlib import Path
 
 import duckdb
 import httpx
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from database import get_db_connection
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = BASE_DIR / "dev.duckdb"
@@ -915,7 +919,7 @@ def _emit_ingestion_run_summary(mode, stats):
 
 def run_fec_ingestion(mode="both", force=False):
     api_key = get_fec_api_key()
-    conn = duckdb.connect(str(DB_PATH))
+    conn = get_db_connection(DB_PATH)
     stats = {
         "status": "failed",
         "members": 0,

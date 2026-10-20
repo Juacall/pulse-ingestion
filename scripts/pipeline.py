@@ -8,6 +8,7 @@ import asyncio
 import httpx
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+import requests
 import duckdb
 
 # Bounded queue and concurrency limits to prevent memory bloat and rate-limiting
@@ -35,6 +36,7 @@ from config import (
     MEMBER_LIMIT as DEFAULT_MEMBER_LIMIT,
 )
 from database import (
+    get_db_connection,
     check_tables_exist,
     create_tables,
     get_district_geoids,
@@ -159,43 +161,114 @@ def setup_database(
 
 
 # -- Ingestion -----------------------------------------------------------------
+def fetch_and_upsert_latest_votes(congress=118, session=2):
+    conn = get_db_connection()
 
-def run_votes_ingestion():
-    logger.info("Connecting to MotherDuck for ingestion write...")
-    conn = get_db_connection(read_only=False)
+    # 1. Fetch recent House roll calls from Congress.gov API
+    url = f"https://api.congress.gov/v3/house-vote/{congress}/{session}?api_key={API_KEY}&format=json&limit=20"
+    response = requests.get(url)
 
-    try:
-        # 1. Execute DDL / Staging tables
-        conn.execute("""
-                     CREATE TABLE IF NOT EXISTS main.fact_member_votes (
-                                                                           vote_id VARCHAR,
-                                                                           member_id VARCHAR,
-                                                                           vote_position VARCHAR(20),
-                         PRIMARY KEY (vote_id, member_id)
-                         );
-                     """)
+    if response.status_code != 200:
+        raise Exception(f"Congress.gov API returned status {response.status_code}")
 
-        # 2. Insert/Upsert fresh Congressional votes from OpenFEC/ProPublica/Congress.gov APIs
-        # conn.execute("INSERT INTO main.fact_member_votes ...")
+    recent_votes = response.json().get("houseVotes", [])
+    print(f"Fetched {len(recent_votes)} recent roll calls from Congress.gov API.")
 
-        # 3. Re-build or update the analytical attendance view
-        conn.execute("""
-                     CREATE OR REPLACE VIEW main.mart_member_attendance AS
-                     SELECT
-                         member_id,
-                         COUNT(vote_id) AS total_eligible_votes,
-                         COUNT(CASE WHEN vote_position = 'Not Voting' THEN 1 END) AS missed_votes,
-                         ROUND(
-                                 (COUNT(CASE WHEN vote_position = 'Not Voting' THEN 1 END)::FLOAT / COUNT(vote_id)) * 100,
-                                 2
-                         ) AS missed_vote_pct
-                     FROM main.fact_member_votes
-                     GROUP BY member_id;
-                     """)
-        logger.info("Ingestion and MotherDuck view refresh complete.")
+    records_to_insert = []
 
-    finally:
-        conn.close()
+    for vote in recent_votes:
+        roll_number = vote.get("rollCallNumber")
+        vote_id = f"{congress}_{session}_h{roll_number}"
+
+        # Check if vote_id already exists in MotherDuck to save API calls
+        exists = conn.execute(
+            "SELECT 1 FROM main.fact_member_votes WHERE vote_id = ? LIMIT 1;",
+            [vote_id]
+        ).fetchone()
+
+        if exists:
+            continue
+
+        # Detail fetch for individual member voting positions
+        detail_url = f"https://api.congress.gov/v3/house-vote/{congress}/{session}/{roll_number}?api_key={API_KEY}&format=json"
+        detail_res = requests.get(detail_url).json()
+
+        positions = detail_res.get("houseVote", {}).get("positions", [])
+        for pos in positions:
+            records_to_insert.append((
+                vote_id,
+                pos.get("bioguideId"),
+                pos.get("votePosition"),  # 'Yea', 'Nay', 'Present', 'Not Voting'
+                'congress_gov_api'
+            ))
+
+    # 2. Batch UPSERT into MotherDuck
+    if records_to_insert:
+        print(f"Upserting {len(records_to_insert)} new voting records...")
+        conn.executemany("""
+                         INSERT INTO main.fact_member_votes (vote_id, member_id, vote_position, data_source)
+                         VALUES (?, ?, ?, ?)
+                             ON CONFLICT (vote_id, member_id) DO UPDATE SET
+                             vote_position = EXCLUDED.vote_position,
+                                                                     data_source = EXCLUDED.data_source;
+                         """, records_to_insert)
+        print("Upsert successful.")
+    else:
+        print("MotherDuck is already up-to-date with latest votes.")
+
+    conn.close()
+
+def run_initial_bulk_load_votes():
+    conn = get_db_connection()
+
+    print("1. Loading raw Voteview bulk vote records into MotherDuck...")
+
+    # Load 118th Congress Member Vote Records and Map Vote Codes
+    # Voteview cast_code mapping: 0 = Not Voting, 1-3 = Yea, 4-6 = Nay, 7-9 = Present
+    conn.execute("""
+                 CREATE OR REPLACE TABLE main.fact_member_votes AS
+                 SELECT
+                     CONCAT(v.congress, '_', LOWER(v.chamber), '_', v.rollnumber) AS vote_id,
+                     m.bioguide_id AS member_id, -- Corrected column name
+                     CASE
+                         WHEN v.cast_code = 0 THEN 'Not Voting'
+                         WHEN v.cast_code IN (1, 2, 3) THEN 'Yea'
+                         WHEN v.cast_code IN (4, 5, 6) THEN 'Nay'
+                         WHEN v.cast_code IN (7, 8, 9) THEN 'Present'
+                         ELSE 'Not Voting'
+                         END AS vote_position,
+                     'bulk_voteview' AS data_source,
+                     CURRENT_TIMESTAMP AS ingested_at
+                 FROM read_csv_auto('https://voteview.com/static/data/out/votes/HS118_votes.csv') v
+                          JOIN read_csv_auto('https://voteview.com/static/data/out/members/HS118_members.csv') m
+                               ON v.icpsr = m.icpsr AND v.chamber = m.chamber;
+                 """)
+
+    # Primary key constraints for safe ON CONFLICT upserts during incremental updates
+    conn.execute("""
+                 ALTER TABLE main.fact_member_votes
+                     ADD PRIMARY KEY (vote_id, member_id);
+                 """)
+
+    print("2. Creating analytical attendance view...")
+    conn.execute("""
+                 CREATE OR REPLACE VIEW main.mart_member_attendance AS
+                 SELECT
+                     member_id,
+                     COUNT(vote_id) AS total_eligible_votes,
+                     COUNT(CASE WHEN vote_position = 'Not Voting' THEN 1 END) AS missed_votes,
+                     COUNT(CASE WHEN vote_position = 'Present' THEN 1 END) AS present_abstain_votes,
+                     ROUND(
+                             (COUNT(CASE WHEN vote_position = 'Not Voting' THEN 1 END)::FLOAT / COUNT(vote_id)) * 100,
+                             2
+                     ) AS missed_vote_pct
+                 FROM main.fact_member_votes
+                 GROUP BY member_id;
+                 """)
+
+    conn.close()
+    print("Initial bulk hydration complete!")
+
 
 def ingest_members(
         db,
@@ -759,7 +832,7 @@ def start_pipeline(args):
     ingest_bills = ingestion_mode in ("bills", "all")
     ingest_amendments = ingestion_mode in ("amendments", "all")
 
-    db = duckdb.connect(str(DB_PATH))
+    db = get_db_connection()
 
     # Setup phase (table initialization/reset)
     reset_tables = []

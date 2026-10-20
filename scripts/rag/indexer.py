@@ -1,10 +1,14 @@
 from pathlib import Path
 import hashlib
 import json
+import sys
 import os
 import time
 
 import duckdb
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from database import get_db_connection
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import voyageai
 from voyageai.error import (
@@ -348,7 +352,7 @@ def _prepare_source_chunks(
 def build_vector_index(db_path: str | Path = DB_PATH) -> None:
     print(f"Opening DuckDB database at {db_path}...", flush=True)
     try:
-        conn = duckdb.connect(str(db_path))
+        conn = get_db_connection(Path(db_path))
     except duckdb.IOException as error:
         if "being used by another process" in str(error).lower():
             raise RuntimeError(

@@ -5,3 +5,7 @@ pulse_backend:
       type: duckdb
       path: ../dev.duckdb
       threads: 4
+    prod:
+      type: duckdb
+      path: "md:{{ env_var('MOTHERDUCK_DB_NAME', 'pulse_prod') }}"
+      threads: 4

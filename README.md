@@ -12,6 +12,21 @@
 8. Back in the project root, run the inherited ingestion: `cd .. && uv run scripts/main.py`
 9. Build the inherited dbt models: `cd dbt && uv run dbt build`
 
+### Building in MotherDuck
+
+Ingestion writes the raw tables to MotherDuck (`MOTHERDUCK_TOKEN` set), but dbt
+defaults to the local `dev.duckdb`. To create the seeds and marts in MotherDuck,
+use the `prod` target (database `MOTHERDUCK_DB_NAME`, default `pulse_prod`).
+Seed before ingesting, since member ingestion needs the census seed table:
+
+```powershell
+cd dbt; uv run dbt seed --target prod
+cd ..; uv run scripts/main.py
+cd dbt; uv run dbt build --target prod
+```
+
+Re-run the last two commands whenever ingestion runs again to refresh the marts.
+
 Step 8 takes roughly 10 minutes with the inherited defaults (the script makes ~800 API calls). Step 9 is sub-second.
 
 ### Run ingestion stages separately
