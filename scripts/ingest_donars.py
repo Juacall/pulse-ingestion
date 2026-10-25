@@ -8,8 +8,10 @@ import sys
 import time
 from pathlib import Path
 
-import duckdb
 import httpx
+import requests
+
+from config import API_KEY
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from database import get_db_connection
@@ -17,7 +19,7 @@ from database import get_db_connection
 BASE_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = BASE_DIR / "dev.duckdb"
 LOG_PATH = BASE_DIR / "logs" / "openfec_ingestion.log"
-CROSSWALK_PATH = BASE_DIR / "dbt" / "seeds" / "legislators-current.csv"
+CROSSWALK_PATH = BASE_DIR / "dbt" / "seeds" / "legislators_current.csv"
 FEC_BASE_URL = "https://api.open.fec.gov/v1"
 DONOR_CYCLE = 2026
 DONOR_SYNC_MAX_AGE_DAYS = int(os.getenv("DONOR_SYNC_MAX_AGE_DAYS", "7"))
@@ -684,6 +686,16 @@ def _save_candidate_mapping(conn, mapping):
     )
 
 
+def fetch_committee_info(fec_candidate_id):
+    url = f"{FEC_BASE_URL}/candidate/{fec_candidate_id}/committees/?api_key={API_KEY}&designation=P"
+    res = requests.get(url).json()
+    results = res.get("results", [])
+    if results:
+        # Returns primary committee metadata registered with FEC
+        return results[0]
+    return None
+
+
 def _ensure_candidate_mappings(conn, members, api_key):
     crosswalk = load_legislator_fec_crosswalk()
     mapping_rows = conn.execute("""
@@ -944,6 +956,7 @@ def run_fec_ingestion(mode="both", force=False):
         "donor_rows_replaced": 0,
         "donor_empty": 0,
         "donor_unmapped": 0,
+        "donar_urls": 0,
     }
     try:
         init_donor_tables(conn)
@@ -1116,6 +1129,41 @@ def run_fec_ingestion(mode="both", force=False):
             print("Committee-report summary cross-check complete!")
             return
 
+        if mode == "campaign_urls":
+            count = 0
+            for member in members:
+                bioguide_id = member[0]
+                if count == 5:
+                    time.sleep(1)
+                    count = 0
+                # 1. Parameterize query and fetch scalar value
+                row = conn.execute(
+                    "SELECT fec_candidate_id FROM main.member_fec_candidate_mapping WHERE bioguide_id = ?",
+                    [bioguide_id]
+                ).fetchone()
+
+                if not row or not row[0]:
+                    continue
+
+                fec_candidate_id = row[0]
+                result = fetch_committee_info(fec_candidate_id)
+
+                if result:
+                    campaign_url = result.get("website")
+                    committee_id = result.get("committee_id")
+                    stats["campaign_urls"] = stats.get("campaign_urls", 0) + 1
+
+                    # 2. Use UPDATE instead of INSERT ... WHERE
+                    conn.execute(
+                        """
+                        UPDATE main.raw_members
+                        SET campaign_url = ?, committee_id = ?
+                        WHERE bioguide_id = ?
+                        """,
+                        [campaign_url, committee_id, bioguide_id],
+                    )
+                    count+= 1
+
         if mode in ("both", "donors"):
             donor_members = [
                 member for member in members
@@ -1244,6 +1292,15 @@ if __name__ == "__main__":
         dest="mode",
         help="Fill missing summary totals from candidate committee filings.",
     )
+
+    mode_group.add_argument(
+        "--campaign_urls",
+        action="store_const",
+        const="campaign_urls",
+        dest="mode",
+        help="Add donation urls for each member.",
+    )
+
     parser.add_argument(
         "--force",
         action="store_true",

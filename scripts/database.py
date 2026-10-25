@@ -22,30 +22,30 @@ logger = logging.getLogger(__name__)
 
 
 def get_db_connection(db_path: Path = DB_PATH, read_only: bool = False):
-    """Connect to MotherDuck; the local file is used only when ALLOW_LOCAL_DB_FALLBACK is true."""
-    token = os.getenv("MOTHERDUCK_TOKEN")
-    database_name = os.getenv("MOTHERDUCK_DB_NAME") or "pulse_prod"
-    if token:
-        logger.info("Using MotherDuck database '%s'.", database_name)
-        # The token is read from MOTHERDUCK_TOKEN by DuckDB, so it never appears in the URL
-        conn = duckdb.connect(f"md:{database_name}")
-        if read_only:
-            conn.execute("SET custom_user_agent='legipulse-fastapi-read';")
-        return conn
-
-    fallback_allowed = os.getenv("ALLOW_LOCAL_DB_FALLBACK", "").strip().lower() in {"1", "true", "yes"}
-    if not fallback_allowed:
-        message = (
-            "MOTHERDUCK_TOKEN is not set and ALLOW_LOCAL_DB_FALLBACK is not enabled. "
-            f"Set MOTHERDUCK_TOKEN, or set ALLOW_LOCAL_DB_FALLBACK=true to use {db_path}."
-        )
-        logger.error(message)
-        raise RuntimeError(message)
-
-    logger.warning(
-        "MOTHERDUCK_TOKEN is not set; ALLOW_LOCAL_DB_FALLBACK is enabled, using local database %s.",
-        db_path,
-    )
+    # """Connect to MotherDuck; the local file is used only when ALLOW_LOCAL_DB_FALLBACK is true."""
+    # token = os.getenv("MOTHERDUCK_TOKEN")
+    # database_name = os.getenv("MOTHERDUCK_DB_NAME") or "pulse_prod"
+    # if token:
+    #     logger.info("Using MotherDuck database '%s'.", database_name)
+    #     # The token is read from MOTHERDUCK_TOKEN by DuckDB, so it never appears in the URL
+    #     conn = duckdb.connect(f"md:{database_name}")
+    #     if read_only:
+    #         conn.execute("SET custom_user_agent='legipulse-fastapi-read';")
+    #     return conn
+    #
+    # fallback_allowed = os.getenv("ALLOW_LOCAL_DB_FALLBACK", "").strip().lower() in {"1", "true", "yes"}
+    # if not fallback_allowed:
+    #     message = (
+    #         "MOTHERDUCK_TOKEN is not set and ALLOW_LOCAL_DB_FALLBACK is not enabled. "
+    #         f"Set MOTHERDUCK_TOKEN, or set ALLOW_LOCAL_DB_FALLBACK=true to use {db_path}."
+    #     )
+    #     logger.error(message)
+    #     raise RuntimeError(message)
+    #
+    # logger.warning(
+    #     "MOTHERDUCK_TOKEN is not set; ALLOW_LOCAL_DB_FALLBACK is enabled, using local database %s.",
+    #     db_path,
+    # )
     return duckdb.connect(str(db_path), read_only=read_only)
 
 
@@ -64,6 +64,14 @@ def check_tables_exist(db, tables: list[str] = None) -> bool:
     if missing:
         return False
     return True
+
+def drop_table(db, table_name: str):
+    # Ensure table_name contains only alphanumeric characters and underscores
+
+    db.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+
+def addColumn(db,table_name,column_name, type):
+    db.execute(f'ALTER TABLE main.{table_name} ADD COLUMN {column_name} {type}')
 
 
 def create_tables(db, replace: bool = False, replace_tables: list[str] | None = None):
@@ -97,10 +105,14 @@ def create_tables(db, replace: bool = False, replace_tables: list[str] | None = 
             district      INTEGER,
             party         VARCHAR,
             geoid_cd      VARCHAR,
+            website_url   VARCHAR,
+            campaign_url  VARCHAR,
+            committee_id  VARCHAR,
             update_date   TIMESTAMP,
             row_hash      VARCHAR,
             ingested_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (bioguide_id)
+            
         )
     """)
     db.execute(f"""

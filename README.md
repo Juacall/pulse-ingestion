@@ -69,7 +69,7 @@ each member's FEC candidate ID, cycle receipts, PAC and individual
 contributions, and OpenFEC coverage end date. Candidate IDs are reused on
 subsequent runs. `member_fec_candidate_mapping` records the bioguide-to-FEC ID
 mapping, validation status, matched candidate details, and candidate options
-for manual review. Mapping uses `dbt/seeds/legislators-current.csv` as its
+for manual review. Mapping uses `dbt/seeds/legislators_current.csv` as its
 primary Bioguide-to-FEC crosswalk. It checks the listed FEC candidate IDs
 against OpenFEC for the current cycle, then validates the candidate's office
 and state; matching House districts are preferred, and district mismatches are

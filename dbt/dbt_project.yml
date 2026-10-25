@@ -15,7 +15,7 @@ clean-targets:
 
 seeds:
   pulse_backend:
-    legislators-current:
+    legislators_current:
       +column_types:
         twitter_id: VARCHAR
     target_counties:

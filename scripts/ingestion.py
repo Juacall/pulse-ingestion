@@ -22,9 +22,6 @@ def load_members(db, members):
 
     Returns a stats dict describing the incremental outcome:
       {"total", "inserted", "updated", "unchanged"}
-    - inserted:  bioguide_id not previously in raw_members
-    - updated:   existed, but row_hash changed (content differs)
-    - unchanged: existed with identical row_hash (write skipped by the ON CONFLICT WHERE clause)
     """
     if not members:
         return {"total": 0, "inserted": 0, "updated": 0, "unchanged": 0}
@@ -34,19 +31,23 @@ def load_members(db, members):
     for m in members:
         bid = m.get("bioguideId")
         name = m.get("name")
-        state = m.get("state")
+        state = m.get("state") or m.get("stateCode")
         chamber = m.get("chamber") or ("House" if m.get("district") is not None else "Senate")
         district = m.get("district")
-        party = m.get("partyName")
-        geoid_cd = m.get("_geoid_cd")
+        party = m.get("partyName") or m.get("party")
+        geoid_cd = m.get("geoid_cd") or m.get("_geoid_cd")
+        website_url = m.get("website_url")
         update_date = m.get("updateDate")
 
-        row_hash = _compute_hash(bid, name, state, chamber, district, party, geoid_cd)
-        rows.append((bid, name, state, chamber, district, party, geoid_cd, update_date, row_hash, now_iso))
+        row_hash = _compute_hash(bid, name, state, chamber, district, party, geoid_cd, website_url)
 
-    # Classify each incoming row against what's already stored so the caller can
-    # report new / changed / unchanged counts. Done before the upsert because the
-    # ON CONFLICT WHERE clause silently skips unchanged rows (no affected-row signal).
+        # Tuple Order:
+        # [0]: bid, [1]: name, [2]: state, [3]: chamber, [4]: district,
+        # [5]: party, [6]: geoid_cd, [7]: website_url, [8]: update_date,
+        # [9]: row_hash, [10]: now_iso
+        rows.append((bid, name, state, chamber, district, party, geoid_cd, website_url, update_date, row_hash, now_iso))
+
+    # Classify each incoming row against stored records
     existing_hashes = {}
     bids = [r[0] for r in rows if r[0] is not None]
     if bids:
@@ -61,7 +62,7 @@ def load_members(db, members):
 
     inserted = updated = unchanged = 0
     for r in rows:
-        bid, new_hash = r[0], r[8]
+        bid, new_hash = r[0], r[9]
         if bid not in existing_hashes:
             inserted += 1
         elif existing_hashes[bid] != new_hash:
@@ -70,21 +71,23 @@ def load_members(db, members):
             unchanged += 1
 
     db.executemany("""
-        INSERT INTO main.raw_members (
-            bioguide_id, name, state, chamber, district, party, geoid_cd, update_date, row_hash, ingested_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (bioguide_id) DO UPDATE SET
-            name = EXCLUDED.name,
-            state = EXCLUDED.state,
-            chamber = EXCLUDED.chamber,
-            district = EXCLUDED.district,
-            party = EXCLUDED.party,
-            geoid_cd = EXCLUDED.geoid_cd,
-            update_date = EXCLUDED.update_date,
-            row_hash = EXCLUDED.row_hash,
-            ingested_at = EXCLUDED.ingested_at
-        WHERE main.raw_members.row_hash != EXCLUDED.row_hash
-    """, rows)
+                   INSERT INTO main.raw_members (
+                       bioguide_id, name, state, chamber, district, party, geoid_cd, website_url, update_date, row_hash, ingested_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT (bioguide_id) DO UPDATE SET
+                       name = EXCLUDED.name,
+                                                        state = EXCLUDED.state,
+                                                        chamber = EXCLUDED.chamber,
+                                                        district = EXCLUDED.district,
+                                                        party = EXCLUDED.party,
+                                                        geoid_cd = EXCLUDED.geoid_cd,
+                                                        website_url = EXCLUDED.website_url,
+                                                        update_date = EXCLUDED.update_date,
+                                                        row_hash = EXCLUDED.row_hash,
+                                                        ingested_at = EXCLUDED.ingested_at
+                                                    WHERE main.raw_members.row_hash IS NULL
+                                                       OR main.raw_members.row_hash != EXCLUDED.row_hash
+                   """, rows)
 
     return {
         "total": len(rows),

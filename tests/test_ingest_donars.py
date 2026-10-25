@@ -224,7 +224,7 @@ def test_fetch_fec_candidate_mapping_flags_ambiguous_candidates(monkeypatch):
 
 
 def test_load_legislator_fec_crosswalk_splits_candidate_ids(tmp_path):
-    crosswalk_path = tmp_path / "legislators-current.csv"
+    crosswalk_path = tmp_path / "legislators_current.csv"
     crosswalk_path.write_text(
         'bioguide_id,fec_ids\nG000001,"H6WA01001,S4WA00011"\n',
         encoding="utf-8",
@@ -265,7 +265,7 @@ def test_ensure_candidate_mappings_uses_crosswalk_before_name_search(
 ):
     conn = duckdb.connect(":memory:")
     ingest_donars.init_donor_tables(conn)
-    crosswalk_path = tmp_path / "legislators-current.csv"
+    crosswalk_path = tmp_path / "legislators_current.csv"
     crosswalk_path.write_text(
         'bioguide_id,fec_ids\nG000001,"H6WA01001,H4WA01001"\n',
         encoding="utf-8",

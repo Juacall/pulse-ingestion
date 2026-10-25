@@ -33,6 +33,7 @@ MOCK_MEMBERS = [
         "district": 14,
         "partyName": "Republican",
         "_geoid_cd": "1314",
+        "website_url": "www.example.com",
         "updateDate": "2025-01-15T12:00:00Z",
     },
     {
@@ -43,6 +44,7 @@ MOCK_MEMBERS = [
         "district": 21,
         "partyName": "Republican",
         "_geoid_cd": "4821",
+        "website_url": "www.example.com",
         "updateDate": "2025-01-16T15:30:00Z",
     },
 ]
@@ -57,6 +59,7 @@ MOCK_SENATE_MEMBERS = [
         "district": None,
         "partyName": "Republican",
         "_geoid_cd": None,
+        "website_url": "www.example.com",
         "updateDate": "2025-01-10T10:00:00Z",
     },
     {
@@ -67,6 +70,7 @@ MOCK_SENATE_MEMBERS = [
         "district": None,
         "partyName": "Democrat",
         "_geoid_cd": None,
+        "website_url": "www.example.com",
         "updateDate": "2025-01-11T11:00:00Z",
     },
 ]
