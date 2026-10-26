@@ -15,6 +15,8 @@ with house_members as (
         m.district_number,
         m.party_name,
         m.geoid_cd,
+        m.website_url,
+        m.campaign_url,
         lpad(cast(census.GEOID_COUNTY_20 as varchar), 5, '0') as county_fips,
         c.county_name,
         m.state_code as county_state
@@ -39,6 +41,8 @@ senate_members as (
         m.district_number,  -- NULL for Senators
         m.party_name,
         m.geoid_cd,         -- NULL for Senators
+        m.website_url,
+        m.campaign_url,
         c.county_fips,
         c.county_name,
         m.state_code as county_state
