@@ -73,7 +73,8 @@ members as (
         party,
         geoid_cd,
         website_url,
-        campaign_url
+        campaign_url,
+        committee_id
     from {{ source('congress', 'raw_members') }}
     where
         bioguide_id is not null
@@ -93,7 +94,8 @@ select
     trim(members.party)                       as party_name,
     members.geoid_cd                          as geoid_cd,
     members.website_url                       as website_url,
-    members.campaign_url                      as campaign_url
+    members.campaign_url                      as campaign_url,
+    members.committee_id                      as committee_id
 from members
 left join state_lookup
     on upper(trim(cast(members.state as varchar))) in (

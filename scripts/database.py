@@ -128,13 +128,12 @@ def create_tables(db, replace: bool = False, replace_tables: list[str] | None = 
             relationship        VARCHAR,
             update_date         TIMESTAMP,
             row_hash            VARCHAR,
+            introduced_date     VARCHAR,
             ingested_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (congress, bill_type, bill_number, member_id, relationship)
         )
     """)
-    db.execute(
-        "ALTER TABLE main.raw_bills ADD COLUMN IF NOT EXISTS introduced_date VARCHAR"
-    )
+
     db.execute(f"""
         {create_stmt("raw_amendments")} main.raw_amendments (
             congress          INTEGER,

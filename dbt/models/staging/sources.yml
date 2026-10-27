@@ -13,11 +13,46 @@ version: 2
 sources:
   - name: congress
     description: >
-      Raw tables ingested from the Congress API by scripts/main.py.
+      Raw tables ingested from the Congress API and OpenFEC API by scripts/main.py.
       These tables are written directly to the main schema of dev.duckdb
       and serve as the starting point for all dbt transformations.
     schema: main
     tables:
+      - name: raw_fec_candidates
+        description: >
+          One row per non-incumbent challenger or open-seat candidate running in the target election cycle,
+          fetched from the OpenFEC API (/v1/candidates/ and /v1/committees/).
+        columns:
+          - name: candidate_id
+            description: Unique candidate identifier assigned by the FEC.
+            data_tests:
+              - unique
+              - not_null
+          - name: name
+            description: Candidate's full legal name.
+          - name: state
+            description: Two-letter state or territory abbreviation.
+          - name: chamber
+            description: Standardized office sought ('House' or 'Senate').
+          - name: district
+            description: Two-character district string ('01', '02', '00' for At-Large/Senate).
+          - name: party
+            description: Standardized single-word party affiliation.
+          - name: geoid_cd
+            description: 4-character congressional district GEOID matching GEOID_CD119_20 in the census seed.
+          - name: campaign_url
+            description: Official campaign website URL retrieved from the candidate's principal campaign committee.
+          - name: committee_id
+            description: Principal campaign committee ID assigned by the FEC.
+          - name: incumbent_challenge
+            description: Code for candidate challenge status ('C' for Challenger, 'O' for Open Seat).
+          - name: election_year
+            description: Target election cycle year (e.g., 2026).
+          - name: fec_update_date
+            description: Timestamp indicating when the record was last updated by the FEC.
+          - name: row_hash
+            description: Hash of record attributes used for deduplication and update tracking.
+
       - name: raw_members
         description: >
           One row per current House or Senate member, fetched from the
@@ -35,6 +70,12 @@ sources:
             description: Party affiliation.
           - name: geoid_cd
             description: 4-character congressional district GEOID matching GEOID_CD119_20 in the census seed.
+          - name: campaign_url
+            description: Official campaign website URL retrieved from the candidate's principal campaign committee.
+          - name: committee_id
+            description: Principal campaign committee ID assigned by the FEC.
+          - name: row_hash
+            description: Hash of record attributes used for deduplication and update tracking.
 
       - name: raw_bills
         description: >
@@ -68,8 +109,7 @@ sources:
             description: How the member is connected — 'sponsor' or 'cosponsor'.
             data_tests:
               - accepted_values:
-                  arguments:
-                    values: ['sponsor', 'cosponsor']
+                  values: ['sponsor', 'cosponsor']
 
       - name: raw_amendments
         description: >
@@ -93,3 +133,6 @@ sources:
             description: Stated purpose of the amendment.
           - name: sponsor_id
             description: bioguide_id of the amendment sponsor (may be null or outside target districts).
+
+      - name: member_fec_candidate_mapping
+      - name: politician_top_donors

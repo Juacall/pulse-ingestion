@@ -161,6 +161,7 @@ def setup_database(
 
 
 # -- Ingestion -----------------------------------------------------------------
+
 def fetch_and_upsert_latest_votes(congress=119, session=2):
     conn = get_db_connection()
 

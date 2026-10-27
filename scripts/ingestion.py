@@ -7,13 +7,106 @@ Includes MD5 checksum generation and timestamp tracking.
 
 import hashlib
 from datetime import datetime, timezone
-
+from typing import Dict, Any, List, Optional
 
 def _compute_hash(*values) -> str:
     """Compute an MD5 hash over given string/numeric values."""
     payload = "|".join("" if v is None else str(v) for v in values)
     return hashlib.md5(payload.encode("utf-8")).hexdigest()
 
+
+def load_candidates(db, candidates: List[Dict[str, Any]]) -> Dict[str, int]:
+    if not candidates:
+        return {"total": 0, "inserted": 0, "updated": 0, "unchanged": 0}
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    rows = []
+
+    for c in candidates:
+        cid = c.get("candidate_id")
+        if not cid:
+            continue
+
+        name = c.get("name")
+        state = c.get("state")
+        chamber = c.get("chamber")
+        district = c.get("district")
+        party = c.get("party")
+
+        # Calculate Census GEOID standard (e.g. NC State FIPS 37 + District 07 = 3707)
+        geoid_cd = c.get("geoid_cd")
+
+        campaign_url = c.get("campaign_url")
+        committee_id = c.get("committee_id")
+        incumbent_challenge = c.get("incumbent_challenge")
+        election_year = int(c.get("election_year", 2026))
+        fec_update_date = c.get("fec_update_date")
+
+        row_hash = _compute_hash(
+            cid, name, state, chamber, district, party,
+            geoid_cd, campaign_url, committee_id, incumbent_challenge, election_year
+        )
+
+        rows.append((
+            cid, name, state, chamber, district, party, geoid_cd,
+            campaign_url, committee_id, incumbent_challenge, election_year,
+            fec_update_date, row_hash, now_iso
+        ))
+
+    if not rows:
+        return {"total": 0, "inserted": 0, "updated": 0, "unchanged": 0}
+
+    # Identify existing row hashes
+    cids = [r[0] for r in rows]
+    placeholders = ",".join("?" for _ in cids)
+    existing_hashes = {
+        cid: h
+        for cid, h in db.execute(
+            f"SELECT candidate_id, row_hash FROM main.raw_fec_candidates WHERE candidate_id IN ({placeholders})",
+            cids,
+        ).fetchall()
+    }
+
+    inserted = updated = unchanged = 0
+    for r in rows:
+        cid, new_hash = r[0], r[12]
+        if cid not in existing_hashes:
+            inserted += 1
+        elif existing_hashes[cid] != new_hash:
+            updated += 1
+        else:
+            unchanged += 1
+
+    db.executemany("""
+                   INSERT INTO main.raw_fec_candidates (
+                       candidate_id, name, state, chamber, district, party, geoid_cd,
+                       campaign_url, committee_id, incumbent_challenge, election_year,
+                       fec_update_date, row_hash, ingested_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT (candidate_id) DO UPDATE SET
+                       name = EXCLUDED.name,
+                                                         state = EXCLUDED.state,
+                                                         chamber = EXCLUDED.chamber,
+                                                         district = EXCLUDED.district,
+                                                         party = EXCLUDED.party,
+                                                         geoid_cd = EXCLUDED.geoid_cd,
+                                                         campaign_url = EXCLUDED.campaign_url,
+                                                         committee_id = EXCLUDED.committee_id,
+                                                         incumbent_challenge = EXCLUDED.incumbent_challenge,
+                                                         election_year = EXCLUDED.election_year,
+                                                         fec_update_date = EXCLUDED.fec_update_date,
+                                                         row_hash = EXCLUDED.row_hash,
+                                                         ingested_at = EXCLUDED.ingested_at
+                                                     WHERE main.raw_fec_candidates.row_hash IS NULL
+                                                        OR main.raw_fec_candidates.row_hash != EXCLUDED.row_hash
+                   """, rows)
+
+    return {
+        "total": len(rows),
+        "inserted": inserted,
+        "updated": updated,
+        "unchanged": unchanged,
+    }
 
 def load_members(db, members):
     """

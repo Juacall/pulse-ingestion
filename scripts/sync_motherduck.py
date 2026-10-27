@@ -89,21 +89,23 @@ def update_views(conn, md_db: str, source_db: str = "local_db"):
         pending = failed
 
 
-# Main execution
-conn = duckdb.connect("md:")
-conn.execute(f"CREATE DATABASE IF NOT EXISTS {MD_DATABASE}")
-conn.execute(f"USE {MD_DATABASE}")
-conn.execute("INSTALL vss")
-conn.execute("LOAD vss")
-conn.execute("SET hnsw_enable_experimental_persistence = true")
-conn.execute(f"ATTACH '{LOCAL_DB_PATH}' AS local_db (READ_ONLY)")
+if __name__ == "__main__":
 
-# Perform table sync (Set overwrite=True if schema structure changes frequently)
-update_tables(conn, md_db=MD_DATABASE, source_db="local_db", overwrite=False)
+    # Main execution
+    conn = duckdb.connect("md:")
+    conn.execute(f"CREATE DATABASE IF NOT EXISTS {MD_DATABASE}")
+    conn.execute(f"USE {MD_DATABASE}")
+    conn.execute("INSTALL vss")
+    conn.execute("LOAD vss")
+    conn.execute("SET hnsw_enable_experimental_persistence = true")
+    conn.execute(f"ATTACH '{LOCAL_DB_PATH}' AS local_db (READ_ONLY)")
 
-# Perform view sync
-update_views(conn, md_db=MD_DATABASE, source_db="local_db")
+    # Perform table sync (Set overwrite=True if schema structure changes frequently)
+    update_tables(conn, md_db=MD_DATABASE, source_db="local_db", overwrite=False)
 
-conn.execute("DETACH local_db")
-conn.close()
-print(f"Successfully updated MotherDuck database ({MD_DATABASE}).")
+    # Perform view sync
+    update_views(conn, md_db=MD_DATABASE, source_db="local_db")
+
+    conn.execute("DETACH local_db")
+    conn.close()
+    print(f"Successfully updated MotherDuck database ({MD_DATABASE}).")

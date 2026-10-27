@@ -126,45 +126,57 @@ def get_fec_api_key() -> str:
 
 def init_donor_tables(conn):
     """Create donor tables in dev.duckdb."""
+
+    """Create generic politician donor tables in dev.duckdb."""
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS member_fec_summary (
-            bioguide_id VARCHAR PRIMARY KEY,
-            fec_candidate_id VARCHAR,
-            total_receipts DOUBLE,
-            pac_contributions DOUBLE,
-            individual_contributions DOUBLE,
-            coverage_end_date VARCHAR,
-            summary_source VARCHAR
-        )
+                 CREATE TABLE IF NOT EXISTS politician_fec_summary (
+                                                                       politician_id VARCHAR PRIMARY KEY,
+                                                                       fec_candidate_id VARCHAR,
+                                                                       total_receipts DOUBLE,
+                                                                       pac_contributions DOUBLE,
+                                                                       individual_contributions DOUBLE,
+                                                                       coverage_end_date VARCHAR,
+                                                                       summary_source VARCHAR
+                 )
+                 """)
+    conn.execute("""
+                 CREATE TABLE IF NOT EXISTS politician_top_donors (
+                                                                      politician_id VARCHAR,
+                                                                      donor_name VARCHAR,
+                                                                      amount DOUBLE,
+                                                                      industry VARCHAR,
+                                                                      cycle VARCHAR,
+                                                                      PRIMARY KEY (politician_id, donor_name, cycle)
+                     )
+                 """)
+    conn.execute("""
+                 CREATE TABLE IF NOT EXISTS politician_fec_sync_state (
+                                                                          politician_id VARCHAR,
+                                                                          cycle VARCHAR,
+                                                                          synced_at TIMESTAMP,
+                                                                          PRIMARY KEY (politician_id, cycle)
+                     )
+                 """)
+    conn.execute("""
+        DROP TABLE IF EXISTS member_fec_summary
     """)
-    conn.execute(
-        "ALTER TABLE main.member_fec_summary ADD COLUMN IF NOT EXISTS summary_source VARCHAR"
+    conn.execute("""CREATE TABLE IF NOT EXISTS main.politician_fec_summary_sync_state (
+        politician_id VARCHAR,
+    cycle VARCHAR,
+    synced_at TIMESTAMP,
+    PRIMARY KEY (politician_id, cycle)
     )
+    """)
+
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS member_top_donors (
-            bioguide_id VARCHAR,
-            donor_name VARCHAR,
-            amount DOUBLE,
-            industry VARCHAR,
-            cycle VARCHAR,
-            PRIMARY KEY (bioguide_id, donor_name, cycle)
-        )
+        DROP TABLE IF EXISTS member_top_donors 
     """)
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS member_fec_sync_state (
-            bioguide_id VARCHAR,
-            cycle VARCHAR,
-            synced_at TIMESTAMP,
-            PRIMARY KEY (bioguide_id, cycle)
-        )
+        DROP TABLE IF EXISTS member_fec_sync_state
+        
     """)
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS member_fec_summary_sync_state (
-            bioguide_id VARCHAR,
-            cycle VARCHAR,
-            synced_at TIMESTAMP,
-            PRIMARY KEY (bioguide_id, cycle)
-        )
+        DROP TABLE IF  EXISTS member_fec_summary_sync_state 
     """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS member_fec_candidate_mapping (
@@ -481,20 +493,65 @@ def _mapping_from_crosswalk_candidates(member, fec_candidate_ids, candidates):
 
 
 def fetch_candidate_committees(
-    fec_candidate_id: str, api_key: str, cycle: int = DONOR_CYCLE
-) -> list[dict]:
-    """Fetch non-joint-fundraising committees associated with a candidate."""
+        fec_candidate_id: str, api_key: str, cycle: int = DONOR_CYCLE
+) -> tuple[list[dict], dict | None]:
+    """Fetch non-joint-fundraising committees and extract primary campaign metadata."""
     response = _get_fec_response(
         f"candidate/{fec_candidate_id}/committees/",
         {"api_key": api_key, "cycle": cycle, "per_page": 100},
     )
+
     committees = {}
+    primary_info = None
+
     for row in response.json().get("results", []):
         committee_id = row.get("committee_id")
-        if committee_id and row.get("designation") != "J":
-            committees[committee_id] = row
-    return list(committees.values())
+        designation = row.get("designation")
 
+        # Capture non-joint-fundraising committees for donor aggregation
+        if committee_id and designation != "J":
+            committees[committee_id] = row
+
+        # Capture principal campaign committee ('P') details
+        if designation == "P" and primary_info is None:
+            primary_info = {
+                "committee_id": committee_id,
+                "campaign_url": row.get("website"),
+            }
+
+
+    return list(committees.values()), primary_info
+
+def _persist_committee_info(
+        conn, politician_id: str, is_incumbent: bool, committee_info: dict | None
+):
+    """Persist principal committee ID and campaign website to the target raw table."""
+    if not committee_info:
+        return
+
+    committee_id = committee_info.get("committee_id")
+    campaign_url = committee_info.get("campaign_url")
+
+    if is_incumbent:
+        conn.execute(
+            """
+            UPDATE main.raw_members
+            SET campaign_url = COALESCE(?, campaign_url),
+                committee_id = COALESCE(?, committee_id)
+            WHERE bioguide_id = ?
+            """,
+            [campaign_url, committee_id, politician_id],
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE main.raw_fec_candidates
+            SET campaign_url = COALESCE(?, campaign_url),
+                committee_id = COALESCE(?, committee_id)
+            WHERE candidate_id = ?
+            """,
+            [campaign_url, committee_id, politician_id],
+        )
 
 def fetch_candidate_committee_ids(
     fec_candidate_id: str, api_key: str, cycle: int = DONOR_CYCLE
@@ -573,11 +630,11 @@ def fetch_top_pac_contributors(
     fec_candidate_id: str, api_key: str, cycle: int = DONOR_CYCLE
 ) -> list[dict]:
     """Fetch top employer aggregates from the candidate's committees."""
-    committee_ids = fetch_candidate_committee_ids(
+    committee_ids, primary_committee_info = fetch_candidate_committee_ids(
         fec_candidate_id, api_key, cycle
     )
     if not committee_ids:
-        return []
+        return [], primary_committee_info
 
     response = _get_fec_response(
         "schedules/schedule_a/by_employer/",
@@ -603,14 +660,16 @@ def fetch_top_pac_contributors(
     top_employers = sorted(
         totals_by_employer.items(), key=lambda item: item[1], reverse=True
     )[:5]
-    return [
+
+
+    donors = [
         {
             "donor_name": donor_name,
             "amount": amount,
             "industry": "Employer aggregate",
         }
-        for donor_name, amount in top_employers
-    ]
+        for donor_name, amount in top_employers]
+    return donors, primary_committee_info
 
 
 def fetch_fec_candidate_summaries(
@@ -642,6 +701,17 @@ def fetch_fec_candidate_summaries(
             }
     return summaries
 
+def _mark_synced(conn, table, politician_ids):
+    for pol_id in politician_ids:
+        conn.execute(
+            f"""
+            INSERT INTO main.{table} (politician_id, cycle, synced_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (politician_id, cycle) DO UPDATE SET
+                synced_at = EXCLUDED.synced_at
+            """,
+            [pol_id, str(DONOR_CYCLE)],
+        )
 
 def _save_candidate_mapping(conn, mapping):
     conn.execute(
@@ -686,15 +756,21 @@ def _save_candidate_mapping(conn, mapping):
     )
 
 
-def fetch_committee_info(fec_candidate_id):
-    url = f"{FEC_BASE_URL}/candidate/{fec_candidate_id}/committees/?api_key={API_KEY}&designation=P"
-    res = requests.get(url).json()
-    results = res.get("results", [])
-    if results:
-        # Returns primary committee metadata registered with FEC
-        return results[0]
-    return None
-
+def _seed_candidate_direct_mappings(conn, candidates):
+    for c in candidates:
+        # c: (politician_id, name, state, chamber, district, fec_candidate_id, is_incumbent)
+        pol_id, name, state, chamber, district, fec_cid, is_incumbent = c
+        if not is_incumbent and fec_cid:
+            conn.execute("""
+                         INSERT INTO main.member_fec_candidate_mapping (
+                             bioguide_id, member_name, state_code, chamber, district_number,
+                             fec_candidate_id, fec_candidate_name, fec_office, fec_state,
+                             fec_district, mapping_status, mapping_reason, candidate_options,
+                             checked_at
+                         )
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DIRECT_FEC', 'Native OpenFEC candidate record', '[]', CURRENT_TIMESTAMP)
+                             ON CONFLICT (bioguide_id) DO NOTHING
+                         """, [pol_id, name, state, chamber, district, fec_cid, name, chamber[0] if chamber else None, state, str(district) if district else None])
 
 def _ensure_candidate_mappings(conn, members, api_key):
     crosswalk = load_legislator_fec_crosswalk()
@@ -809,60 +885,50 @@ def _ensure_candidate_mappings(conn, members, api_key):
     return mappings
 
 
-def _save_candidate_id(conn, bioguide_id, fec_id):
+def _save_candidate_id(conn, politician_id, fec_id):
     """Persist a resolved FEC ID without replacing existing summary values."""
     conn.execute(
         """
-        INSERT INTO main.member_fec_summary (bioguide_id, fec_candidate_id)
+        INSERT INTO main.politician_fec_summary (politician_id, fec_candidate_id)
         VALUES (?, ?)
-        ON CONFLICT (bioguide_id) DO UPDATE SET fec_candidate_id = EXCLUDED.fec_candidate_id
+            ON CONFLICT (politician_id) DO UPDATE SET
+            fec_candidate_id = EXCLUDED.fec_candidate_id
         """,
-        [bioguide_id, fec_id],
+        [politician_id, fec_id],
     )
 
-
-def _mark_synced(conn, table, bioguide_ids):
-    for bioguide_id in bioguide_ids:
+def _mark_synced(conn, table, politician_ids):
+    """Mark politicians as synced in the target sync table."""
+    for pol_id in politician_ids:
         conn.execute(
             f"""
-            INSERT INTO main.{table} (bioguide_id, cycle, synced_at)
+            INSERT INTO main.{table} (politician_id, cycle, synced_at)
             VALUES (?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT (bioguide_id, cycle) DO UPDATE SET
+            ON CONFLICT (politician_id, cycle) DO UPDATE SET
                 synced_at = EXCLUDED.synced_at
             """,
-            [bioguide_id, str(DONOR_CYCLE)],
+            [pol_id, str(DONOR_CYCLE)],
         )
 
 
-def _upsert_summary(conn, bioguide_id, fec_id, summary):
+def _upsert_summary(conn, politician_id, fec_id, summary):
     conn.execute(
         """
-        INSERT INTO main.member_fec_summary (
-            bioguide_id, fec_candidate_id, total_receipts, pac_contributions,
+        INSERT INTO main.politician_fec_summary (
+            politician_id, fec_candidate_id, total_receipts, pac_contributions,
             individual_contributions, coverage_end_date, summary_source
         )
         VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (bioguide_id) DO UPDATE SET
+            ON CONFLICT (politician_id) DO UPDATE SET
             fec_candidate_id = EXCLUDED.fec_candidate_id,
-            total_receipts = COALESCE(
-                EXCLUDED.total_receipts, member_fec_summary.total_receipts
-            ),
-            pac_contributions = COALESCE(
-                EXCLUDED.pac_contributions, member_fec_summary.pac_contributions
-            ),
-            individual_contributions = COALESCE(
-                EXCLUDED.individual_contributions,
-                member_fec_summary.individual_contributions
-            ),
-            coverage_end_date = COALESCE(
-                EXCLUDED.coverage_end_date, member_fec_summary.coverage_end_date
-            ),
-            summary_source = COALESCE(
-                EXCLUDED.summary_source, member_fec_summary.summary_source
-            )
+                                               total_receipts = COALESCE(EXCLUDED.total_receipts, politician_fec_summary.total_receipts),
+                                               pac_contributions = COALESCE(EXCLUDED.pac_contributions, politician_fec_summary.pac_contributions),
+                                               individual_contributions = COALESCE(EXCLUDED.individual_contributions, politician_fec_summary.individual_contributions),
+                                               coverage_end_date = COALESCE(EXCLUDED.coverage_end_date, politician_fec_summary.coverage_end_date),
+                                               summary_source = COALESCE(EXCLUDED.summary_source, politician_fec_summary.summary_source)
         """,
         [
-            bioguide_id,
+            politician_id,
             fec_id,
             summary.get("total_receipts") if summary else None,
             summary.get("pac_contributions") if summary else None,
@@ -929,6 +995,7 @@ def _emit_ingestion_run_summary(mode, stats):
         print(line)
 
 
+
 def run_fec_ingestion(mode="both", force=False):
     api_key = get_fec_api_key()
     conn = get_db_connection(DB_PATH)
@@ -956,41 +1023,69 @@ def run_fec_ingestion(mode="both", force=False):
         "donor_rows_replaced": 0,
         "donor_empty": 0,
         "donor_unmapped": 0,
-        "donar_urls": 0,
     }
     try:
         init_donor_tables(conn)
-        members = conn.execute("""
-            SELECT DISTINCT member_id, member_name, state_code, chamber, district_number
-            FROM main.stg_members
-            WHERE member_id IS NOT NULL
-              AND member_name IS NOT NULL
-              AND state_code IS NOT NULL
-              AND chamber IS NOT NULL
-            ORDER BY member_id
-        """).fetchall()
 
-        stats["members"] = len(members)
-        print(f"Found {len(members)} unique members to sync FEC data for...")
+        # 1. Pull all politicians (Incumbents + Challengers) from dim_politicians
+        politicians = conn.execute("""
+                                   SELECT DISTINCT
+                                       id                          AS politician_id,
+                                       name                        AS politician_name,
+                                       state                       AS state_code,
+                                       chamber,
+                                       district                    AS district_number,
+                                       candidate_id                AS fec_candidate_id,
+                                       is_incumbent
+                                   FROM main.dim_politicians
+                                   WHERE id IS NOT NULL
+                                     AND name IS NOT NULL
+                                     AND state IS NOT NULL
+                                   ORDER BY id
+                                   """).fetchall()
+
+        stats["members"] = len(politicians)
+        print(f"Found {len(politicians)} politicians (members + candidates) to sync FEC data for...")
+
+        # 2. Resolve FEC Candidate Mappings
+        # Separate incumbents (need fuzzy/crosswalk resolution) from candidates (native candidate_id)
+        incumbents = [p for p in politicians if p[6] is True]
+        non_incumbents = [p for p in politicians if p[6] is False]
+
+        candidate_ids = {}
         try:
-            candidate_ids = _ensure_candidate_mappings(conn, members, api_key)
+            # Resolve mapping for sitting members (incumbents)
+            if incumbents:
+                incumbent_members = [p[:5] for p in incumbents]
+                incumbent_mappings = _ensure_candidate_mappings(conn, incumbent_members, api_key)
+                candidate_ids.update(incumbent_mappings)
+
+            # Direct map for challengers/candidates whose candidate_id is already known
+            for p in non_incumbents:
+                pol_id, name, state, chamber, district, fec_cid, is_incumbent = p
+                fec_id_to_use = fec_cid or pol_id  # For candidates, pol_id is the FEC candidate_id
+                if fec_id_to_use:
+                    candidate_ids[pol_id] = fec_id_to_use
+
         except (OpenFECRateLimitError, OpenFECRequestTimeoutError) as error:
             stats["status"] = "paused"
             _log_openfec_failure(error, mode)
             return
+
         stats["mapped"] = len(candidate_ids)
-        stats["unmapped"] = len(members) - len(candidate_ids)
+        stats["unmapped"] = len(politicians) - len(candidate_ids)
         if mode == "mappings":
             stats["status"] = "completed"
             print("FEC candidate mapping refresh complete!")
             return
 
+        # 3. Load Freshness & Sync States using politician_id
         recently_synced_summaries = {
             row[0]
             for row in conn.execute(
                 """
-                SELECT bioguide_id
-                FROM main.member_fec_summary_sync_state
+                SELECT politician_id
+                FROM main.politician_fec_summary_sync_state
                 WHERE cycle = ?
                   AND synced_at >= CURRENT_TIMESTAMP - (? * INTERVAL '1 day')
                 """,
@@ -1000,18 +1095,19 @@ def run_fec_ingestion(mode="both", force=False):
         summaries_with_totals = {
             row[0]
             for row in conn.execute("""
-                SELECT bioguide_id
-                FROM main.member_fec_summary
-                WHERE total_receipts IS NOT NULL
-            """).fetchall()
+                                    SELECT politician_id
+                                    FROM main.politician_fec_summary
+                                    WHERE total_receipts IS NOT NULL
+                                    """).fetchall()
         }
         recently_synced_summaries.intersection_update(summaries_with_totals)
+
         recently_synced_donors = {
             row[0]
             for row in conn.execute(
                 """
-                SELECT bioguide_id
-                FROM main.member_fec_sync_state
+                SELECT politician_id
+                FROM main.politician_fec_sync_state
                 WHERE cycle = ?
                   AND synced_at >= CURRENT_TIMESTAMP - (? * INTERVAL '1 day')
                 """,
@@ -1022,21 +1118,24 @@ def run_fec_ingestion(mode="both", force=False):
             recently_synced_summaries.clear()
             recently_synced_donors.clear()
 
+        # 4. Mode: Financial Summaries
         if mode in ("both", "summaries"):
-            summary_members = [
-                member for member in members
-                if member[0] not in recently_synced_summaries
-                and member[0] in candidate_ids
+            summary_politicians = [
+                pol for pol in politicians
+                if pol[0] not in recently_synced_summaries
+                   and pol[0] in candidate_ids
             ]
-            stats["summary_eligible"] = len(summary_members)
-            stats["summary_fresh"] = len(candidate_ids) - len(summary_members)
-            stats["summary_unmapped"] = len(members) - len(candidate_ids)
-            candidates = [
-                (member[0], member[1], candidate_ids[member[0]])
-                for member in summary_members
+            stats["summary_eligible"] = len(summary_politicians)
+            stats["summary_fresh"] = len(candidate_ids) - len(summary_politicians)
+            stats["summary_unmapped"] = len(politicians) - len(candidate_ids)
+
+            candidates_batch_list = [
+                (pol[0], pol[1], candidate_ids[pol[0]])
+                for pol in summary_politicians
             ]
-            for offset in range(0, len(candidates), SUMMARY_BATCH_SIZE):
-                batch = candidates[offset:offset + SUMMARY_BATCH_SIZE]
+
+            for offset in range(0, len(candidates_batch_list), SUMMARY_BATCH_SIZE):
+                batch = candidates_batch_list[offset:offset + SUMMARY_BATCH_SIZE]
                 stats["summary_attempted"] += len(batch)
                 try:
                     summaries = _with_rate_limit_context(
@@ -1055,51 +1154,52 @@ def run_fec_ingestion(mode="both", force=False):
 
                 conn.execute("BEGIN TRANSACTION")
                 try:
-                    synced_bioguide_ids = []
-                    for bioguide_id, _name, fec_id in batch:
+                    synced_politician_ids = []
+                    for pol_id, _name, fec_id in batch:
                         summary = summaries.get(fec_id)
                         if summary is None:
                             stats["summary_absent"] += 1
                             continue
-                        _upsert_summary(conn, bioguide_id, fec_id, summary)
+                        _upsert_summary(conn, pol_id, fec_id, summary)
                         if summary["total_receipts"] is not None:
-                            synced_bioguide_ids.append(bioguide_id)
+                            synced_politician_ids.append(pol_id)
                             stats["summary_saved"] += 1
                             source = summary.get("summary_source") or "unspecified"
                             stats["summary_sources"][source] = (
-                                stats["summary_sources"].get(source, 0) + 1
+                                    stats["summary_sources"].get(source, 0) + 1
                             )
                         else:
                             stats["summary_missing_total"] += 1
-                    _mark_synced(conn, "member_fec_summary_sync_state", synced_bioguide_ids)
+                    _mark_synced(conn, "politician_fec_summary_sync_state", synced_politician_ids)
                     conn.execute("COMMIT")
                 except Exception:
                     conn.execute("ROLLBACK")
                     raise
-                missing_count = len(batch) - len(synced_bioguide_ids)
+                missing_count = len(batch) - len(synced_politician_ids)
                 print(
-                    f"Synced summaries for {len(synced_bioguide_ids)} members; "
+                    f"Synced summaries for {len(synced_politician_ids)} politicians; "
                     f"{missing_count} remain eligible for retry or report cross-check"
                 )
 
+        # 5. Mode: Summary Cross-Check
         if mode == "summary-cross-check":
-            members_needing_fallback = [
-                member
-                for member in members
-                if member[0] in candidate_ids
-                and member[0] not in summaries_with_totals
+            politicians_needing_fallback = [
+                pol for pol in politicians
+                if pol[0] in candidate_ids
+                   and pol[0] not in summaries_with_totals
             ]
-            stats["fallback_eligible"] = len(members_needing_fallback)
-            stats["summary_unmapped"] = len(members) - len(candidate_ids)
-            for bioguide_id, name, _state, _chamber, _district in members_needing_fallback:
-                fec_id = candidate_ids[bioguide_id]
+            stats["fallback_eligible"] = len(politicians_needing_fallback)
+            stats["summary_unmapped"] = len(politicians) - len(candidate_ids)
+
+            for pol_id, name, _state, _chamber, _district, _fec_cid, _is_inc in politicians_needing_fallback:
+                fec_id = candidate_ids[pol_id]
                 stats["fallback_attempted"] += 1
                 try:
                     fallback_summary = _with_rate_limit_context(
                         lambda: fetch_candidate_committee_report_summary(
                             fec_id, api_key, cycle=DONOR_CYCLE
                         ),
-                        f"committee-report summary for {name} ({bioguide_id}, {fec_id})",
+                        f"committee-report summary for {name} ({pol_id}, {fec_id})",
                     )
                 except (OpenFECRateLimitError, OpenFECRequestTimeoutError) as error:
                     _log_openfec_failure(error, mode)
@@ -1113,12 +1213,8 @@ def run_fec_ingestion(mode="both", force=False):
 
                 conn.execute("BEGIN TRANSACTION")
                 try:
-                    _upsert_summary(
-                        conn, bioguide_id, fec_id, fallback_summary
-                    )
-                    _mark_synced(
-                        conn, "member_fec_summary_sync_state", [bioguide_id]
-                    )
+                    _upsert_summary(conn, pol_id, fec_id, fallback_summary)
+                    _mark_synced(conn, "politician_fec_summary_sync_state", [pol_id])
                     conn.execute("COMMIT")
                 except Exception:
                     conn.execute("ROLLBACK")
@@ -1129,97 +1225,69 @@ def run_fec_ingestion(mode="both", force=False):
             print("Committee-report summary cross-check complete!")
             return
 
-        if mode == "campaign_urls":
-            count = 0
-            for member in members:
-                bioguide_id = member[0]
-                if count == 5:
-                    time.sleep(1)
-                    count = 0
-                # 1. Parameterize query and fetch scalar value
-                row = conn.execute(
-                    "SELECT fec_candidate_id FROM main.member_fec_candidate_mapping WHERE bioguide_id = ?",
-                    [bioguide_id]
-                ).fetchone()
-
-                if not row or not row[0]:
-                    continue
-
-                fec_candidate_id = row[0]
-                result = fetch_committee_info(fec_candidate_id)
-
-                if result:
-                    campaign_url = result.get("website")
-                    committee_id = result.get("committee_id")
-                    stats["campaign_urls"] = stats.get("campaign_urls", 0) + 1
-
-                    # 2. Use UPDATE instead of INSERT ... WHERE
-                    conn.execute(
-                        """
-                        UPDATE main.raw_members
-                        SET campaign_url = ?, committee_id = ?
-                        WHERE bioguide_id = ?
-                        """,
-                        [campaign_url, committee_id, bioguide_id],
-                    )
-                    count+= 1
-
+        # 7. Mode: Top Donors / Employers
         if mode in ("both", "donors"):
-            donor_members = [
-                member for member in members
-                if member[0] not in recently_synced_donors
-                and member[0] in candidate_ids
+            donor_politicians = [
+                pol for pol in politicians
+                if pol[0] not in recently_synced_donors
+                   and pol[0] in candidate_ids
             ]
-            stats["donor_eligible"] = len(donor_members)
-            stats["donor_fresh"] = len(candidate_ids) - len(donor_members)
-            stats["donor_unmapped"] = len(members) - len(candidate_ids)
-            candidates = [
-                (member[0], member[1], candidate_ids[member[0]])
-                for member in donor_members
+            stats["donor_eligible"] = len(donor_politicians)
+            stats["donor_fresh"] = len(candidate_ids) - len(donor_politicians)
+            stats["donor_unmapped"] = len(politicians) - len(candidate_ids)
+
+            donor_candidates = [
+                (pol[0], pol[1], candidate_ids[pol[0]])
+                for pol in donor_politicians
             ]
-            for bioguide_id, name, fec_id in candidates:
+
+            for pol_id, name, fec_id in donor_candidates:
                 try:
-                    donors = _with_rate_limit_context(
+                    donors, committee_info = _with_rate_limit_context(
                         lambda: fetch_top_pac_contributors(
                             fec_id, api_key, cycle=DONOR_CYCLE
                         ),
-                        f"donor lookup for {name} ({bioguide_id}, {fec_id})",
+                        f"donor lookup for {name} ({pol_id}, {fec_id})",
                     )
                 except (OpenFECRateLimitError, OpenFECRequestTimeoutError) as error:
                     _log_openfec_failure(error, mode)
                     stats["status"] = "paused"
                     return
+
                 conn.execute("BEGIN TRANSACTION")
                 try:
-                    _save_candidate_id(conn, bioguide_id, fec_id)
+                    _save_candidate_id(conn, pol_id, fec_id)
+                    _persist_committee_info(conn, pol_id, is_incumbent, committee_info)
                     existing_rows = conn.execute(
                         """
                         SELECT COUNT(*)
-                        FROM main.member_top_donors
-                        WHERE bioguide_id = ? AND cycle = ?
+                        FROM main.politician_top_donors
+                        WHERE politician_id = ? AND cycle = ?
                         """,
-                        [bioguide_id, str(DONOR_CYCLE)],
+                        [pol_id, str(DONOR_CYCLE)],
                     ).fetchone()[0]
+
                     conn.execute(
-                        "DELETE FROM main.member_top_donors WHERE bioguide_id = ? AND cycle = ?",
-                        [bioguide_id, str(DONOR_CYCLE)],
+                        "DELETE FROM main.politician_top_donors WHERE politician_id = ? AND cycle = ?",
+                        [pol_id, str(DONOR_CYCLE)],
                     )
+
                     for donor in donors:
                         conn.execute(
                             """
-                            INSERT INTO main.member_top_donors
-                                (bioguide_id, donor_name, amount, industry, cycle)
+                            INSERT INTO main.politician_top_donors
+                                (politician_id, donor_name, amount, industry, cycle)
                             VALUES (?, ?, ?, ?, ?)
                             """,
                             [
-                                bioguide_id,
+                                pol_id,
                                 donor["donor_name"],
                                 donor["amount"],
                                 donor["industry"],
                                 str(DONOR_CYCLE),
                             ],
                         )
-                    _mark_synced(conn, "member_fec_sync_state", [bioguide_id])
+                    _mark_synced(conn, "politician_fec_sync_state", [pol_id])
                     conn.execute("COMMIT")
                 except Exception:
                     conn.execute("ROLLBACK")
@@ -1236,7 +1304,6 @@ def run_fec_ingestion(mode="both", force=False):
         _emit_ingestion_run_summary(mode, stats)
 
     print("FEC Campaign Finance Ingestion Complete!")
-
 
 def _log_openfec_failure(
     error: OpenFECRateLimitError | OpenFECRequestTimeoutError, mode: str
@@ -1291,14 +1358,6 @@ if __name__ == "__main__":
         const="summary-cross-check",
         dest="mode",
         help="Fill missing summary totals from candidate committee filings.",
-    )
-
-    mode_group.add_argument(
-        "--campaign_urls",
-        action="store_const",
-        const="campaign_urls",
-        dest="mode",
-        help="Add donation urls for each member.",
     )
 
     parser.add_argument(

@@ -1,28 +1,3 @@
--- int_legislative_activity.sql
---
--- GRAIN: one row per member x activity.
---
--- Unions bills and amendments into a single activity feed, each row tied to a
--- target district member. is sent into the mart after joining with member-county data.
---
--- Bills are linked to the member who sponsored or cosponsored them.
---
--- Amendments link via their parent bill — so each amendment fans out to one row
--- per member connected to that bill. The relationship column captures whether
--- the member personally sponsored the amendment or just owned the parent bill.
---
--- bill_title is always the parent bill title. amendment_title is null for bills.
---
--- member_id is always the target-district member. amendment_sponsor_id is whoever
--- proposed the amendment. If the amendment sponsor isn't a
--- target district member, their name won't appear; that's intentional since the
--- grain is target district member x activity, not amendment sponsor x activity.
---
--- RELATIONSHIP VALUES:
---   'sponsor'                           — member sponsored the bill
---   'cosponsor'                         — member cosponsored the bill
---   'amendment_sponsor'                 — member sponsored the amendment
---   'sponsored bill received amendment' — member's bill received this amendment
 {{ config(materialized = 'table') }}
 
 with bills as (
@@ -79,7 +54,6 @@ unmerged as (
 )
 
 select
-    -- Generate primary surrogate key on unmerged result
     md5(
             coalesce(cast(member_id as varchar), '') || '-' ||
             coalesce(cast(relationship as varchar), '') || '-' ||
