@@ -136,3 +136,4 @@ sources:
 
       - name: member_fec_candidate_mapping
       - name: politician_top_donors
+      - name: politician_fec_summary

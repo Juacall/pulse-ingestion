@@ -18,13 +18,40 @@ if not LOCAL_DB_PATH.exists():
     raise SystemExit(f"Local database not found: {LOCAL_DB_PATH}")
 
 
-def update_tables(conn, md_db: str, source_db: str = "local_db", overwrite: bool = False):
-    """Syncs tables from attached local_db to target MotherDuck database."""
+def get_table_hash(conn, db_name: str, table_name: str) -> str:
+    """Computes an MD5 checksum for a table across all columns."""
+    cols = [
+        r[0]
+        for r in conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_catalog = ? AND table_schema = 'main' AND table_name = ? "
+            "ORDER BY ordinal_position",
+            [db_name, table_name],
+        ).fetchall()
+    ]
+    if not cols:
+        return ""
+
+    # Concat all columns to string, get lower 64-bit MD5 integer, XOR across the table
+    concat_expr = ", ".join([f"COALESCE(CAST(\"{c}\" AS VARCHAR), '')" for c in cols])
+    query = (
+        f'SELECT BIT_XOR(md5_number_lower(CONCAT({concat_expr}))) '
+        f'FROM {db_name}.main."{table_name}"'
+    )
+    res = conn.execute(query).fetchone()[0]
+    return str(res) if res is not None else ""
+
+def update_tables(conn, md_db: str, source_db: str = "local_db", force_overwrite: bool = False):
+    """Syncs updated tables from local_db to target MotherDuck database using differential hashing."""
+    # Exclude all dbt test artifacts and internal metadata
     tables = [
         r[0]
         for r in conn.execute(
             "SELECT table_name FROM duckdb_tables() "
-            "WHERE database_name = ? AND schema_name = 'main'",
+            "WHERE database_name = ? AND schema_name = 'main' "
+            "AND table_name NOT LIKE '%dbt_test%' "
+            "AND table_name NOT LIKE 'test_%' "
+            "AND table_name NOT LIKE '_dbt_%'",
             [source_db],
         ).fetchall()
     ]
@@ -37,30 +64,26 @@ def update_tables(conn, md_db: str, source_db: str = "local_db", overwrite: bool
         ).fetchone()[0] > 0
 
         if not target_exists:
-            print(f"Creating missing table {name}...")
+            print(f"➕ Creating new table: {name}...")
             conn.execute(
                 f'CREATE TABLE {md_db}.main."{name}" AS '
                 f'SELECT * FROM {source_db}.main."{name}"'
             )
-        elif overwrite:
-            print(f"Overwriting table {name}...")
-            conn.execute(
-                f'CREATE OR REPLACE TABLE {md_db}.main."{name}" AS '
-                f'SELECT * FROM {source_db}.main."{name}"'
-            )
-        else:
-            print(f"Updating table {name}...")
-            try:
-                conn.execute(
-                    f'INSERT OR REPLACE INTO {md_db}.main."{name}" '
-                    f'SELECT * FROM {source_db}.main."{name}"'
-                )
-            except duckdb.Error:
-                print(f"  --> Insert failed for {name}. Fallback to overwrite.")
-                conn.execute(
-                    f'CREATE OR REPLACE TABLE {md_db}.main."{name}" AS '
-                    f'SELECT * FROM {source_db}.main."{name}"'
-                )
+            continue
+
+        if not force_overwrite:
+            local_hash = get_table_hash(conn, source_db, name)
+            remote_hash = get_table_hash(conn, md_db, name)
+
+            if local_hash == remote_hash and local_hash != "":
+                print(f"⏭️ Skipping {name} (No changes detected)")
+                continue
+
+        print(f"🔄 Updating modified table: {name}...")
+        conn.execute(
+            f'CREATE OR REPLACE TABLE {md_db}.main."{name}" AS '
+            f'SELECT * FROM {source_db}.main."{name}"'
+        )
 
 
 def update_views(conn, md_db: str, source_db: str = "local_db"):
@@ -90,8 +113,6 @@ def update_views(conn, md_db: str, source_db: str = "local_db"):
 
 
 if __name__ == "__main__":
-
-    # Main execution
     conn = duckdb.connect("md:")
     conn.execute(f"CREATE DATABASE IF NOT EXISTS {MD_DATABASE}")
     conn.execute(f"USE {MD_DATABASE}")
@@ -100,12 +121,12 @@ if __name__ == "__main__":
     conn.execute("SET hnsw_enable_experimental_persistence = true")
     conn.execute(f"ATTACH '{LOCAL_DB_PATH}' AS local_db (READ_ONLY)")
 
-    # Perform table sync (Set overwrite=True if schema structure changes frequently)
-    update_tables(conn, md_db=MD_DATABASE, source_db="local_db", overwrite=False)
+    # Perform table sync using hash checks
+    update_tables(conn, md_db=MD_DATABASE, source_db="local_db", force_overwrite=False)
 
     # Perform view sync
     update_views(conn, md_db=MD_DATABASE, source_db="local_db")
 
     conn.execute("DETACH local_db")
     conn.close()
-    print(f"Successfully updated MotherDuck database ({MD_DATABASE}).")
+    print(f"Successfully synced MotherDuck database ({MD_DATABASE}).")

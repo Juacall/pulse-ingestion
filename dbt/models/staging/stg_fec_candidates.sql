@@ -14,6 +14,7 @@ SELECT
     incumbent_challenge AS challenge_code,
     election_year,
     fec_update_date,
+    first_file_date,
     row_hash,
     ingested_at
 FROM {{ source('congress', 'raw_fec_candidates') }}

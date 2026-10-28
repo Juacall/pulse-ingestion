@@ -71,7 +71,7 @@ def drop_table(db, table_name: str):
     db.execute(f'DROP TABLE IF EXISTS "{table_name}"')
 
 def addColumn(db,table_name,column_name, type):
-    db.execute(f'ALTER TABLE main.{table_name} ADD COLUMN {column_name} {type}')
+    db.execute(f'ALTER TABLE main.{table_name} ADD COLUMN IF NOT EXIST {column_name} {type}')
 
 
 def create_tables(db, replace: bool = False, replace_tables: list[str] | None = None):
@@ -107,6 +107,7 @@ def create_tables(db, replace: bool = False, replace_tables: list[str] | None = 
             geoid_cd      VARCHAR,
             website_url   VARCHAR,
             campaign_url  VARCHAR,
+            image_url     VARCHAR,
             committee_id  VARCHAR,
             update_date   TIMESTAMP,
             row_hash      VARCHAR,
@@ -128,7 +129,6 @@ def create_tables(db, replace: bool = False, replace_tables: list[str] | None = 
             relationship        VARCHAR,
             update_date         TIMESTAMP,
             row_hash            VARCHAR,
-            introduced_date     VARCHAR,
             ingested_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (congress, bill_type, bill_number, member_id, relationship)
         )

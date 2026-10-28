@@ -58,3 +58,5 @@ models:
 
       - name: bill_introduced_date
         description: Date the bill was introduced, from the Congress.gov API.
+  - name: politician_fec_summary
+    description: Financial Summary Data

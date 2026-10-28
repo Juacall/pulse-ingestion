@@ -5,6 +5,8 @@ from helpers import parse_api_date
 import sys
 import time
 import asyncio
+import ast
+import json
 import httpx
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -43,7 +45,7 @@ from database import (
     get_existing_bills,
     get_existing_bill_timestamps,
     get_existing_members,
-    mark_bill_amendments_processed, drop_table,
+    mark_bill_amendments_processed, drop_table, addColumn,
 )
 from ingestion import load_amendments, load_bills, load_members
 logger = logging.getLogger(__name__)
@@ -297,6 +299,27 @@ def resolve_state_code(raw_state: str | None) -> str | None:
         return clean_state
     return STATE_NAME_TO_CODE.get(clean_state)
 
+def extract_image_url(depiction_data) -> str | None:
+    """Safely extracts imageUrl whether depiction is a dict or string."""
+    if not depiction_data:
+        return None
+
+    # Case 1: Already a dictionary (from response.json())
+    if isinstance(depiction_data, dict):
+        return depiction_data.get("imageUrl")
+
+    # Case 2: String payload (JSON or Python dict string)
+    if isinstance(depiction_data, str):
+        try:
+            # Attempt standard JSON parse first
+            parsed = json.loads(depiction_data.replace("'", '"'))
+            if isinstance(parsed, dict):
+                return parsed.get("imageUrl")
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return None
+
 def ingest_members(
         db,
         member_limit: int | None = DEFAULT_MEMBER_LIMIT,
@@ -315,8 +338,8 @@ def ingest_members(
     )
 
     district_geoids = get_district_geoids(db)
+    count = 0
     for member in members:
-
         state = (member.get("state") or member.get("stateCode") or "").upper()
         district = member.get("district")
         state_code = resolve_state_code(state)
@@ -330,6 +353,9 @@ def ingest_members(
 
         official_url = fetch_member_official_url(member.get("bioguideId"))
         member["website_url"] = official_url
+        member["image_url"] = extract_image_url(member.get("depiction"))
+        count+=1
+        print(f'Member Processed: {member.get("bioguideId")} , {member.get('name')} : [{count}/{len(members)}] ')
     member_stats = load_members(db, members)
     return members, member_stats
 

@@ -123,10 +123,19 @@ def init_fec_db(db):
                                                                       incumbent_challenge VARCHAR,
                                                                       election_year       INTEGER,
                                                                       fec_update_date     TIMESTAMP,
+                                                                      first_file_date     DATE,
+                                                                      has_raised_funds    VARCHAR,
+                                                                      candidate_status    VARCHAR,
                                                                       row_hash            VARCHAR,
                                                                       ingested_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                                                                       PRIMARY KEY (candidate_id)
                    );
+               """)
+    db.execute("""
+               ALTER TABLE raw_fec_candidates ADD COLUMN IF NOT EXISTS first_file_date DATE;
+               ALTER TABLE raw_fec_candidates DROP COLUMN IF EXISTS filing_frequency;
+               ALTER TABLE raw_fec_candidates ADD COLUMN IF NOT EXISTS candidate_status VARCHAR;
+               ALTER TABLE raw_fec_candidates ADD COLUMN IF NOT EXISTS has_raised_funds VARCHAR;
                """)
 
 
@@ -193,7 +202,7 @@ def fetch_committee_details_batch(api_key: str, candidate_ids: List[str]) -> Dic
             for cmte in res.json().get("results", []):
                 cmte_id = cmte.get("committee_id")
                 web_url = cmte.get("website_url")
-
+                print(cmte)
                 # Associated candidate IDs
                 c_ids = cmte.get("candidate_ids") or []
                 for cid in c_ids:
@@ -277,7 +286,6 @@ def ingest_candidates():
 
         chamber = map_fec_office_to_chamber(c.get("office"))
         district = clean_district(c.get("district"))
-
         normalized_records.append({
             "candidate_id": cid,
             "name": c.get("name"),
@@ -290,6 +298,9 @@ def ingest_candidates():
             "committee_id": cmte_id,
             "incumbent_challenge": c.get("incumbent_challenge"),
             "election_year": ELECTION_YEAR,
+            "first_file_date": c.get("first_file_date"),
+            "candidate_status" : c.get("candidate_status"),
+            "has_raised_funds" : c.get("has_raised_funds",False),
             "fec_update_date": c.get("load_date"),
         })
 

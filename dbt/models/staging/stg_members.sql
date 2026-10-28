@@ -74,6 +74,7 @@ members as (
         geoid_cd,
         website_url,
         campaign_url,
+        image_url,
         committee_id
     from {{ source('congress', 'raw_members') }}
     where
@@ -95,6 +96,7 @@ select
     members.geoid_cd                          as geoid_cd,
     members.website_url                       as website_url,
     members.campaign_url                      as campaign_url,
+    members.image_url                         as image_url,
     members.committee_id                      as committee_id
 from members
 left join state_lookup

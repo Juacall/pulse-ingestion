@@ -41,16 +41,19 @@ def load_candidates(db, candidates: List[Dict[str, Any]]) -> Dict[str, int]:
         incumbent_challenge = c.get("incumbent_challenge")
         election_year = int(c.get("election_year", 2026))
         fec_update_date = c.get("fec_update_date")
+        first_file_date = c.get("first_file_date")
+        candidate_status = c.get("candidate_status")
+        has_raised_funds = c.get("has_raised_funds",False)
 
         row_hash = _compute_hash(
             cid, name, state, chamber, district, party,
-            geoid_cd, campaign_url, committee_id, incumbent_challenge, election_year
+            geoid_cd, campaign_url, committee_id, incumbent_challenge, election_year, candidate_status
         )
 
         rows.append((
             cid, name, state, chamber, district, party, geoid_cd,
             campaign_url, committee_id, incumbent_challenge, election_year,
-            fec_update_date, row_hash, now_iso
+            fec_update_date,first_file_date,candidate_status, has_raised_funds, row_hash, now_iso
         ))
 
     if not rows:
@@ -69,7 +72,7 @@ def load_candidates(db, candidates: List[Dict[str, Any]]) -> Dict[str, int]:
 
     inserted = updated = unchanged = 0
     for r in rows:
-        cid, new_hash = r[0], r[12]
+        cid, new_hash = r[0], r[15]
         if cid not in existing_hashes:
             inserted += 1
         elif existing_hashes[cid] != new_hash:
@@ -81,8 +84,8 @@ def load_candidates(db, candidates: List[Dict[str, Any]]) -> Dict[str, int]:
                    INSERT INTO main.raw_fec_candidates (
                        candidate_id, name, state, chamber, district, party, geoid_cd,
                        campaign_url, committee_id, incumbent_challenge, election_year,
-                       fec_update_date, row_hash, ingested_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       fec_update_date, first_file_date, candidate_status,has_raised_funds ,row_hash, ingested_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT (candidate_id) DO UPDATE SET
                        name = EXCLUDED.name,
                                                          state = EXCLUDED.state,
@@ -95,6 +98,9 @@ def load_candidates(db, candidates: List[Dict[str, Any]]) -> Dict[str, int]:
                                                          incumbent_challenge = EXCLUDED.incumbent_challenge,
                                                          election_year = EXCLUDED.election_year,
                                                          fec_update_date = EXCLUDED.fec_update_date,
+                                                         first_file_date = EXCLUDED.first_file_date,
+                                                         candidate_status = EXCLUDED.candidate_status,
+                                                         has_raised_funds = EXCLUDED.has_raised_funds,
                                                          row_hash = EXCLUDED.row_hash,
                                                          ingested_at = EXCLUDED.ingested_at
                                                      WHERE main.raw_fec_candidates.row_hash IS NULL
@@ -129,16 +135,17 @@ def load_members(db, members):
         district = m.get("district")
         party = m.get("partyName") or m.get("party")
         geoid_cd = m.get("geoid_cd") or m.get("_geoid_cd")
-        website_url = m.get("website_url")
+        website_url = m.get("website_url"),
+        image_url = m.get("image_url")
         update_date = m.get("updateDate")
 
-        row_hash = _compute_hash(bid, name, state, chamber, district, party, geoid_cd, website_url)
+        row_hash = _compute_hash(bid, name, state, chamber, district, party, geoid_cd, website_url, image_url)
 
         # Tuple Order:
         # [0]: bid, [1]: name, [2]: state, [3]: chamber, [4]: district,
         # [5]: party, [6]: geoid_cd, [7]: website_url, [8]: update_date,
         # [9]: row_hash, [10]: now_iso
-        rows.append((bid, name, state, chamber, district, party, geoid_cd, website_url, update_date, row_hash, now_iso))
+        rows.append((bid, name, state, chamber, district, party, geoid_cd, website_url,image_url, update_date, row_hash, now_iso))
 
     # Classify each incoming row against stored records
     existing_hashes = {}
@@ -155,7 +162,7 @@ def load_members(db, members):
 
     inserted = updated = unchanged = 0
     for r in rows:
-        bid, new_hash = r[0], r[9]
+        bid, new_hash = r[0], r[10]
         if bid not in existing_hashes:
             inserted += 1
         elif existing_hashes[bid] != new_hash:
@@ -165,8 +172,8 @@ def load_members(db, members):
 
     db.executemany("""
                    INSERT INTO main.raw_members (
-                       bioguide_id, name, state, chamber, district, party, geoid_cd, website_url, update_date, row_hash, ingested_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       bioguide_id, name, state, chamber, district, party, geoid_cd, website_url,  image_url, update_date, row_hash, ingested_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT (bioguide_id) DO UPDATE SET
                        name = EXCLUDED.name,
                                                         state = EXCLUDED.state,
@@ -175,6 +182,7 @@ def load_members(db, members):
                                                         party = EXCLUDED.party,
                                                         geoid_cd = EXCLUDED.geoid_cd,
                                                         website_url = EXCLUDED.website_url,
+                                                        image_url = EXCLUDED.image_url,
                                                         update_date = EXCLUDED.update_date,
                                                         row_hash = EXCLUDED.row_hash,
                                                         ingested_at = EXCLUDED.ingested_at
