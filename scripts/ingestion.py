@@ -8,12 +8,32 @@ Includes MD5 checksum generation and timestamp tracking.
 import hashlib
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
+import json
 
 def _compute_hash(*values) -> str:
     """Compute an MD5 hash over given string/numeric values."""
     payload = "|".join("" if v is None else str(v) for v in values)
     return hashlib.md5(payload.encode("utf-8")).hexdigest()
 
+
+def extract_policy_area(raw_policy_area) -> str:
+    """Safely extracts the policy area name from dicts, JSON strings, or None values."""
+    if not raw_policy_area:
+        return "Uncategorized"
+
+    # Handle stringified JSON from raw DB loads
+    if isinstance(raw_policy_area, str):
+        try:
+            raw_policy_area = json.loads(raw_policy_area)
+        except (json.JSONDecodeError, TypeError):
+            # Fallback if the field is just a plain string scalar
+            return raw_policy_area.strip() or "Uncategorized"
+
+    # Safely access dict key
+    if isinstance(raw_policy_area, dict):
+        return raw_policy_area.get("name") or "Uncategorized"
+
+    return "Uncategorized"
 
 def load_candidates(db, candidates: List[Dict[str, Any]]) -> Dict[str, int]:
     if not candidates:
@@ -210,80 +230,81 @@ def load_bills(db, bills, member_id, relationship):
 
     now_iso = datetime.now(timezone.utc).isoformat()
     rows = []
+
     for b in bills:
         congress = b.get("congress")
         bill_type = b.get("type")
-        bill_number = str(b.get("number"))
+        bill_number = str(b.get("number")) if b.get("number") is not None else ""
         title = b.get("title")
+
+        # Safely extract policyArea string using extract_policy_area helper
+        policy_area = extract_policy_area(b.get("policyArea"))
+
         introduced_date = b.get("introducedDate")
         update_date = b.get("updateDate") or b.get("updateDateIncludingText")
 
-        # Current bill status: the Congress API exposes the most-recent action
-        # inline on the sponsored/cosponsored list response (no extra call). We
-        # track current status only, so this is overwritten on each run.
+        # Extract latest action
         latest_action = b.get("latestAction") or {}
         latest_action_date = latest_action.get("actionDate")
         latest_action_text = latest_action.get("text")
 
+        # Include policy_area in the hash calculation
         row_hash = _compute_hash(
-            congress, bill_type, bill_number, title, member_id, relationship,
-            introduced_date, latest_action_date, latest_action_text
+            congress, bill_type, bill_number, title, policy_area,
+            member_id, relationship, introduced_date,
+            latest_action_date, latest_action_text
         )
+
         rows.append((
-            congress, bill_type, bill_number, title,
+            congress, bill_type, bill_number, title, policy_area,
             introduced_date, latest_action_date, latest_action_text,
             member_id, relationship, update_date, row_hash, now_iso
         ))
 
-    existing_hashes = {}
-    chunk_size = 250
-    for start in range(0, len(rows), chunk_size):
-        chunk = rows[start:start + chunk_size]
-        placeholders = ",".join("(?, ?, ?)" for _ in chunk)
-        params = [member_id, relationship]
-        for row in chunk:
-            params.extend((row[0], row[1], row[2]))
-        existing_hashes.update({
-            (congress, bill_type, bill_number, existing_member_id, existing_relationship): row_hash
-            for congress, bill_type, bill_number, existing_member_id, existing_relationship, row_hash
-            in db.execute(
-                f"""
-                SELECT congress, bill_type, bill_number, member_id, relationship, row_hash
-                FROM main.raw_bills
-                WHERE member_id = ? AND relationship = ?
-                  AND (congress, bill_type, bill_number) IN ({placeholders})
-                """,
-                params,
-            ).fetchall()
-        })
+    # 1. Efficient Hash Lookup (Scope to member_id & relationship)
+    existing_hashes = {
+        (congress, bill_type, bill_number): row_hash
+        for congress, bill_type, bill_number, row_hash in db.execute(
+            """
+            SELECT congress, bill_type, bill_number, row_hash
+            FROM main.raw_bills
+            WHERE member_id = ? AND relationship = ?
+            """,
+            [member_id, relationship],
+        ).fetchall()
+    }
 
+    # 2. Metric Calculation
     inserted = updated = unchanged = 0
     for row in rows:
-        key = (row[0], row[1], row[2], row[7], row[8])
+        key = (row[0], row[1], row[2])  # (congress, bill_type, bill_number)
         existing_hash = existing_hashes.get(key)
+
         if existing_hash is None:
             inserted += 1
-        elif existing_hash != row[10]:
+        elif existing_hash != row[11]:  # row[11] is row_hash
             updated += 1
         else:
             unchanged += 1
 
+    # 3. Idempotent Upsert into DuckDB
     db.executemany("""
-        INSERT INTO main.raw_bills (
-            congress, bill_type, bill_number, title, introduced_date,
-            latest_action_date, latest_action_text, member_id, relationship,
-            update_date, row_hash, ingested_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (congress, bill_type, bill_number, member_id, relationship) DO UPDATE SET
-            title = EXCLUDED.title,
-            introduced_date = EXCLUDED.introduced_date,
-            latest_action_date = EXCLUDED.latest_action_date,
-            latest_action_text = EXCLUDED.latest_action_text,
-            update_date = EXCLUDED.update_date,
-            row_hash = EXCLUDED.row_hash,
-            ingested_at = EXCLUDED.ingested_at
-        WHERE main.raw_bills.row_hash != EXCLUDED.row_hash
-    """, rows)
+                   INSERT INTO main.raw_bills (
+                       congress, bill_type, bill_number, title, policy_area,
+                       introduced_date, latest_action_date, latest_action_text,
+                       member_id, relationship, update_date, row_hash, ingested_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT (congress, bill_type, bill_number, member_id, relationship) DO UPDATE SET
+                       title = EXCLUDED.title,
+                                                                                                      policy_area = EXCLUDED.policy_area,
+                                                                                                      introduced_date = EXCLUDED.introduced_date,
+                                                                                                      latest_action_date = EXCLUDED.latest_action_date,
+                                                                                                      latest_action_text = EXCLUDED.latest_action_text,
+                                                                                                      update_date = EXCLUDED.update_date,
+                                                                                                      row_hash = EXCLUDED.row_hash,
+                                                                                                      ingested_at = EXCLUDED.ingested_at
+                                                                                                  WHERE main.raw_bills.row_hash != EXCLUDED.row_hash
+                   """, rows)
 
     return {
         "total": len(rows),

@@ -45,7 +45,7 @@ from database import (
     get_existing_bills,
     get_existing_bill_timestamps,
     get_existing_members,
-    mark_bill_amendments_processed, drop_table, addColumn,
+    mark_bill_amendments_processed, drop_table, addColumn, dropColumn,
 )
 from ingestion import load_amendments, load_bills, load_members
 logger = logging.getLogger(__name__)
@@ -163,114 +163,6 @@ def setup_database(
 
 
 # -- Ingestion -----------------------------------------------------------------
-
-def fetch_and_upsert_latest_votes(congress=119, session=2):
-    conn = get_db_connection()
-
-    # 1. Fetch recent House roll calls from Congress.gov API
-    url = f"https://api.congress.gov/v3/house-vote/{congress}/{session}?api_key={API_KEY}&format=json&limit=20"
-    response = requests.get(url)
-
-    if response.status_code != 200:
-        raise Exception(f"Congress.gov API returned status {response.status_code}")
-
-    recent_votes = response.json().get("houseVotes", [])
-    print(f"Fetched {len(recent_votes)} recent roll calls from Congress.gov API.")
-
-    records_to_insert = []
-
-    for vote in recent_votes:
-        roll_number = vote.get("rollCallNumber")
-        vote_id = f"{congress}_{session}_h{roll_number}"
-
-        # Check if vote_id already exists in MotherDuck to save API calls
-        exists = conn.execute(
-            "SELECT 1 FROM main.fact_member_votes WHERE vote_id = ? LIMIT 1;",
-            [vote_id]
-        ).fetchone()
-
-        if exists:
-            continue
-
-        # Detail fetch for individual member voting positions
-        detail_url = f"https://api.congress.gov/v3/house-vote/{congress}/{session}/{roll_number}?api_key={API_KEY}&format=json"
-        detail_res = requests.get(detail_url).json()
-
-        positions = detail_res.get("houseVote", {}).get("positions", [])
-        for pos in positions:
-            records_to_insert.append((
-                vote_id,
-                pos.get("bioguideId"),
-                pos.get("votePosition"),  # 'Yea', 'Nay', 'Present', 'Not Voting'
-                'congress_gov_api'
-            ))
-
-    # 2. Batch UPSERT into MotherDuck
-    if records_to_insert:
-        print(f"Upserting {len(records_to_insert)} new voting records...")
-        conn.executemany("""
-                         INSERT INTO main.fact_member_votes (vote_id, member_id, vote_position, data_source)
-                         VALUES (?, ?, ?, ?)
-                             ON CONFLICT (vote_id, member_id) DO UPDATE SET
-                             vote_position = EXCLUDED.vote_position,
-                                                                     data_source = EXCLUDED.data_source;
-                         """, records_to_insert)
-        print("Upsert successful.")
-    else:
-        print("MotherDuck is already up-to-date with latest votes.")
-
-    conn.close()
-
-def run_initial_bulk_load_votes():
-    conn = get_db_connection()
-
-    print("1. Loading raw Voteview bulk vote records into MotherDuck...")
-
-    conn.execute("""
-                 CREATE OR REPLACE TABLE main.fact_member_votes AS
-                 SELECT
-                     CONCAT(v.congress, '_', LOWER(v.chamber), '_', v.rollnumber) AS vote_id,
-                     m.bioguide_id AS member_id, -- Corrected column name
-                     CASE
-                         WHEN v.cast_code IN (1, 2, 3) THEN 'Yea'
-                         WHEN v.cast_code IN (4, 5, 6) THEN 'Nay'
-                         WHEN v.cast_code IN (7, 8) THEN 'Present'
-                         WHEN v.cast_code = 9 THEN 'Not Voting'
-                         ELSE 'Other'
-                         END AS vote_position,
-                     'bulk_voteview' AS data_source,
-                     CURRENT_TIMESTAMP AS ingested_at
-                 FROM read_csv_auto('https://voteview.com/static/data/out/votes/HS118_votes.csv') v
-                          JOIN read_csv_auto('https://voteview.com/static/data/out/members/HS118_members.csv') m
-                               ON v.icpsr = m.icpsr AND v.chamber = m.chamber;
-                 """)
-
-    # Primary key constraints for safe ON CONFLICT upserts during incremental updates
-    conn.execute("""
-                 ALTER TABLE main.fact_member_votes
-                     ADD PRIMARY KEY (vote_id, member_id);
-                 """)
-
-    print("2. Creating analytical attendance view...")
-    conn.execute("""
-                 CREATE OR REPLACE VIEW main.mart_member_attendance AS
-                 SELECT
-                     member_id,
-                     COUNT(vote_id) AS total_eligible_votes,
-                     COUNT(CASE WHEN vote_position = 'Not Voting' THEN 1 END) AS missed_votes,
-                     COUNT(CASE WHEN vote_position = 'Present' THEN 1 END) AS present_abstain_votes,
-                     ROUND(
-                             (COUNT(CASE WHEN vote_position = 'Not Voting' THEN 1 END)::FLOAT / COUNT(vote_id)) * 100,
-                             2
-                     ) AS missed_vote_pct
-                 FROM main.fact_member_votes
-                 GROUP BY member_id;
-                 """)
-
-    conn.close()
-    print("Initial bulk hydration complete!")
-
-
 
 STATE_NAME_TO_CODE = {
     "ALABAMA": "AL", "ALASKA": "AK", "ARIZONA": "AZ", "ARKANSAS": "AR",

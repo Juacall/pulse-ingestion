@@ -80,7 +80,7 @@ select
     members.campaign_url as campaign,
     members.image_url as imageUrl,
     true as is_incumbent,
-    'Active' as status,
+    'Incumbent' as status,
 
     coalesce(activity.sponsored_count, 0) as sponsored_count,
     coalesce(activity.cosponsored_count, 0) as cosponsored_count,

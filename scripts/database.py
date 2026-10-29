@@ -71,7 +71,15 @@ def drop_table(db, table_name: str):
     db.execute(f'DROP TABLE IF EXISTS "{table_name}"')
 
 def addColumn(db,table_name,column_name, type):
-    db.execute(f'ALTER TABLE main.{table_name} ADD COLUMN IF NOT EXIST {column_name} {type}')
+    db.execute(f'ALTER TABLE main.{table_name} ADD COLUMN IF NOT EXISTS {column_name} {type}')
+
+def dropColumn(db, table_name: str, column_name: str):
+    """
+    Safely drop a column from a main schema table in DuckDB if it exists.
+    """
+    # Double-quote identifiers to preserve casing and protect against invalid syntax
+    query = f'ALTER TABLE main."{table_name}" DROP COLUMN IF EXISTS "{column_name}"'
+    db.execute(query)
 
 
 def create_tables(db, replace: bool = False, replace_tables: list[str] | None = None):
@@ -127,6 +135,7 @@ def create_tables(db, replace: bool = False, replace_tables: list[str] | None = 
             latest_action_text  VARCHAR,
             member_id           VARCHAR,
             relationship        VARCHAR,
+            policy_area         VARCHAR,
             update_date         TIMESTAMP,
             row_hash            VARCHAR,
             ingested_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

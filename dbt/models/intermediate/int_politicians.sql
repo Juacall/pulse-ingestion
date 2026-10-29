@@ -16,7 +16,7 @@ SELECT
     m.website_url                           AS website,
     m.campaign_url                          AS campaign,
     TRUE                                    AS is_incumbent,
-    'active_member'                         AS status
+    'incumbent'                         AS status
 FROM {{ ref('stg_members') }} m
 
 UNION ALL
