@@ -131,12 +131,18 @@ def init_fec_db(db):
                                                                       PRIMARY KEY (candidate_id)
                    );
                """)
-    db.execute("""
-               ALTER TABLE raw_fec_candidates ADD COLUMN IF NOT EXISTS first_file_date DATE;
-               ALTER TABLE raw_fec_candidates DROP COLUMN IF EXISTS filing_frequency;
-               ALTER TABLE raw_fec_candidates ADD COLUMN IF NOT EXISTS candidate_status VARCHAR;
-               ALTER TABLE raw_fec_candidates ADD COLUMN IF NOT EXISTS has_raised_funds VARCHAR;
+
+    db.execute(""" DELETE FROM main.dim_politicians
+                   WHERE is_incumbent = FALSE
+                     AND (total_receipts IS NULL OR total_receipts < 5000);
+
+    -- Purge orphan donor records
+    DELETE FROM stg_fec_candidates
+    WHERE politician NOT IN (SELECT fec_candidate_id FROM main.dim_politicians);
+
+
                """)
+
 
 
 
@@ -192,6 +198,7 @@ def fetch_committee_details_batch(api_key: str, candidate_ids: List[str]) -> Dic
         "candidate_id": candidate_ids,  # Pass list of candidate IDs
         "designation": "P",            # Principal Campaign Committee
         "cycle": 2026,
+        "candidate_status": "C",
         "per_page": 100
     }
 
@@ -202,7 +209,6 @@ def fetch_committee_details_batch(api_key: str, candidate_ids: List[str]) -> Dic
             for cmte in res.json().get("results", []):
                 cmte_id = cmte.get("committee_id")
                 web_url = cmte.get("website_url")
-                print(cmte)
                 # Associated candidate IDs
                 c_ids = cmte.get("candidate_ids") or []
                 for cid in c_ids:

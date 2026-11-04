@@ -61,7 +61,10 @@ deduped_candidates as (
         challenge_code,
         first_file_date
     from {{ ref('stg_fec_candidates') }}
-    qualify row_number() over (partition by candidate_id order by first_file_date desc nulls last) = 1
+    qualify row_number() over (
+        partition by candidate_id
+        order by first_file_date desc nulls last
+    ) = 1
 )
 
 -- INCUMBENTS (Members)

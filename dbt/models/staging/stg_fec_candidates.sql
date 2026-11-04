@@ -1,22 +1,23 @@
 -- models/staging/stg_fec_candidates.sql
-{{ config(materialized = 'view') }}
+{{ config(materialized='view') }}
 
-SELECT
+select
     candidate_id,
-    name                AS candidate_name,
-    state               AS state_code,
+    name                as candidate_name,
+    state               as state_code,
     chamber,
-    district            AS district_number,
-    party               AS party_name,
+    district            as district_number,
+    party               as party_name,
     geoid_cd,
     campaign_url,
     committee_id,
-    incumbent_challenge AS challenge_code,
+    candidate_status,
+    incumbent_challenge as challenge_code,
     election_year,
     fec_update_date,
     first_file_date,
     row_hash,
     ingested_at
-FROM {{ source('congress', 'raw_fec_candidates') }}
+from {{ source('congress', 'raw_fec_candidates') }}
 -- Exclude Incumbents ('I') because they are already ingested via stg_members
-WHERE incumbent_challenge != 'I'
+where coalesce(incumbent_challenge, '') != 'I'

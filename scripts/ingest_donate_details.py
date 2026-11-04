@@ -14,7 +14,7 @@ import requests
 from config import API_KEY
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from database import get_db_connection
+from database import get_db_connection, addColumn
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = BASE_DIR / "dev.duckdb"
@@ -134,21 +134,30 @@ def init_donor_tables(conn):
                                                                        fec_candidate_id VARCHAR,
                                                                        total_receipts DOUBLE,
                                                                        pac_contributions DOUBLE,
-                                                                       individual_contributions DOUBLE,
+                                                                       individual_itemized DOUBLE,      -- > $200 (Large Donors)
+                                                                       individual_unitemized DOUBLE,    -- <= $200 (Grassroots)
+                                                                       individual_contributions DOUBLE,         -- Sum of itemized + unitemized
+                                                                       grassroots_percentage DOUBLE,    -- Calculated (unitemized / total_receipts) * 100
                                                                        coverage_end_date VARCHAR,
                                                                        summary_source VARCHAR
-                 )
+                 );
                  """)
+
+    addColumn(conn,"politician_fec_summary","individual_unitemized", "DOUBLE")
+    addColumn(conn,"politician_fec_summary","individual_itemized", "DOUBLE")
+    addColumn(conn,"politician_fec_summary","grassroots_percentage", "DOUBLE")
+
+
     conn.execute("""
-                 CREATE TABLE IF NOT EXISTS politician_top_donors (
-                                                                      politician_id VARCHAR,
-                                                                      donor_name VARCHAR,
-                                                                      amount DOUBLE,
-                                                                      industry VARCHAR,
-                                                                      cycle VARCHAR,
-                                                                      PRIMARY KEY (politician_id, donor_name, cycle)
-                     )
-                 """)
+                     CREATE TABLE IF NOT EXISTS politician_top_donors (
+                                                                          politician_id VARCHAR,
+                                                                          donor_name VARCHAR,
+                                                                          amount DOUBLE,
+                                                                          industry VARCHAR,
+                                                                          cycle VARCHAR,
+                                                                          PRIMARY KEY (politician_id, donor_name, cycle)
+                         )
+                     """)
     conn.execute("""
                  CREATE TABLE IF NOT EXISTS politician_fec_sync_state (
                                                                           politician_id VARCHAR,
@@ -157,27 +166,7 @@ def init_donor_tables(conn):
                                                                           PRIMARY KEY (politician_id, cycle)
                      )
                  """)
-    conn.execute("""
-        DROP TABLE IF EXISTS member_fec_summary
-    """)
-    conn.execute("""CREATE TABLE IF NOT EXISTS main.politician_fec_summary_sync_state (
-        politician_id VARCHAR,
-    cycle VARCHAR,
-    synced_at TIMESTAMP,
-    PRIMARY KEY (politician_id, cycle)
-    )
-    """)
 
-    conn.execute("""
-        DROP TABLE IF EXISTS member_top_donors 
-    """)
-    conn.execute("""
-        DROP TABLE IF EXISTS member_fec_sync_state
-        
-    """)
-    conn.execute("""
-        DROP TABLE IF  EXISTS member_fec_summary_sync_state 
-    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS member_fec_candidate_mapping (
             bioguide_id VARCHAR PRIMARY KEY,
@@ -673,7 +662,7 @@ def fetch_top_pac_contributors(
 
 
 def fetch_fec_candidate_summaries(
-    fec_candidate_ids: list[str], api_key: str, cycle: int = DONOR_CYCLE
+        fec_candidate_ids: list[str], api_key: str, cycle: int = DONOR_CYCLE
 ) -> dict[str, dict]:
     """Fetch summary totals for multiple candidates in a single OpenFEC request."""
     if not fec_candidate_ids:
@@ -692,10 +681,40 @@ def fetch_fec_candidate_summaries(
     for row in response.json().get("results", []):
         candidate_id = row.get("candidate_id")
         if candidate_id:
+            total_receipts = float(row.get("receipts") or row.get("total_receipts") or 0.0)
+
+            # Line 11a(i): > $200 (Itemized)
+            itemized = float(row.get("individual_itemized_contributions") or 0.0)
+
+            # Line 11a Total: Total Individual Contributions
+            total_indiv = float(row.get("individual_contributions") or 0.0)
+
+            # Line 11a(ii): <= $200 (Grassroots Unitemized)
+            # Derived as: Total Individual - Itemized Individual
+            if "individual_unitemized_contributions" in row and row["individual_unitemized_contributions"] is not None:
+                unitemized = float(row["individual_unitemized_contributions"])
+            elif total_indiv >= itemized and total_indiv > 0:
+                unitemized = total_indiv - itemized
+            else:
+                # Secondary fallback if individual_contributions is omitted in OpenFEC payload
+                pac_contribs = float(row.get("other_political_committee_contributions") or 0.0)
+                transfers = float(row.get("transfers_from_other_authorized_committee") or 0.0)
+                unitemized = max(0.0, total_receipts - (itemized + pac_contribs + transfers))
+                total_indiv = itemized + unitemized
+
+            # Line 11c: PACs
+            pac_contribs = float(row.get("other_political_committee_contributions") or 0.0)
+
+            # Grassroots share percentage calculation
+            grassroots_pct = round((unitemized / total_receipts * 100), 2) if total_receipts > 0 else 0.0
+
             summaries[candidate_id] = {
-                "total_receipts": row.get("receipts", row.get("total_receipts")),
-                "pac_contributions": row.get("other_political_committee_contributions"),
-                "individual_contributions": row.get("individual_itemized_contributions"),
+                "total_receipts": total_receipts,
+                "pac_contributions": pac_contribs,
+                "individual_contributions": total_indiv,
+                "individual_itemized": itemized,       # > $200
+                "individual_unitemized": unitemized,   # <= $200 (Grassroots)
+                "grassroots_percentage": grassroots_pct,
                 "coverage_end_date": row.get("coverage_end_date"),
                 "summary_source": "candidate_totals",
             }
@@ -911,30 +930,48 @@ def _mark_synced(conn, table, politician_ids):
         )
 
 
-def _upsert_summary(conn, politician_id, fec_id, summary):
+def _upsert_summary(conn, politician_id: str, fec_id: str, summary: dict | None) -> None:
+    """Upserts OpenFEC financial summary data into main.politician_fec_summary."""
+    if not summary:
+        summary = {}
+
     conn.execute(
         """
         INSERT INTO main.politician_fec_summary (
-            politician_id, fec_candidate_id, total_receipts, pac_contributions,
-            individual_contributions, coverage_end_date, summary_source
+            politician_id,
+            fec_candidate_id,
+            total_receipts,
+            pac_contributions,
+            individual_contributions,
+            individual_itemized,
+            individual_unitemized,
+            grassroots_percentage,
+            coverage_end_date,
+            summary_source
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (politician_id) DO UPDATE SET
             fec_candidate_id = EXCLUDED.fec_candidate_id,
-                                               total_receipts = COALESCE(EXCLUDED.total_receipts, politician_fec_summary.total_receipts),
-                                               pac_contributions = COALESCE(EXCLUDED.pac_contributions, politician_fec_summary.pac_contributions),
-                                               individual_contributions = COALESCE(EXCLUDED.individual_contributions, politician_fec_summary.individual_contributions),
-                                               coverage_end_date = COALESCE(EXCLUDED.coverage_end_date, politician_fec_summary.coverage_end_date),
-                                               summary_source = COALESCE(EXCLUDED.summary_source, politician_fec_summary.summary_source)
+                                               total_receipts = COALESCE(EXCLUDED.total_receipts, main.politician_fec_summary.total_receipts),
+                                               pac_contributions = COALESCE(EXCLUDED.pac_contributions, main.politician_fec_summary.pac_contributions),
+                                               individual_contributions = COALESCE(EXCLUDED.individual_contributions, main.politician_fec_summary.individual_contributions),
+                                               individual_itemized = COALESCE(EXCLUDED.individual_itemized, main.politician_fec_summary.individual_itemized),
+                                               individual_unitemized = COALESCE(EXCLUDED.individual_unitemized, main.politician_fec_summary.individual_unitemized),
+                                               grassroots_percentage = COALESCE(EXCLUDED.grassroots_percentage, main.politician_fec_summary.grassroots_percentage),
+                                               coverage_end_date = COALESCE(EXCLUDED.coverage_end_date, main.politician_fec_summary.coverage_end_date),
+                                               summary_source = COALESCE(EXCLUDED.summary_source, main.politician_fec_summary.summary_source)
         """,
         [
             politician_id,
             fec_id,
-            summary.get("total_receipts") if summary else None,
-            summary.get("pac_contributions") if summary else None,
-            summary.get("individual_contributions") if summary else None,
-            summary.get("coverage_end_date") if summary else None,
-            summary.get("summary_source") if summary else None,
+            summary.get("total_receipts"),
+            summary.get("pac_contributions"),
+            summary.get("individual_contributions"),
+            summary.get("individual_itemized"),
+            summary.get("individual_unitemized"),
+            summary.get("grassroots_percentage"),
+            summary.get("coverage_end_date"),
+            summary.get("summary_source"),
         ],
     )
 
@@ -1035,7 +1072,7 @@ def run_fec_ingestion(mode="both", force=False):
                                        state                       AS state_code,
                                        chamber,
                                        district                    AS district_number,
-                                       candidate_id                AS fec_candidate_id,
+                                       fec_candidate_id                AS fec_candidate_id,
                                        is_incumbent
                                    FROM main.dim_politicians
                                    WHERE id IS NOT NULL

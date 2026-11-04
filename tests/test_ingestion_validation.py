@@ -1,4 +1,4 @@
-"""
+﻿"""
 tests/test_ingestion_validation.py
 
 Unit and integration tests for data ingestion, schema validation, checksumming,
@@ -387,7 +387,7 @@ def test_cli_flags_parsing():
         assert args.house is True
 
 
-@patch("pipeline.fetch_members_for_congress", return_value=MOCK_MEMBERS)
+@patch("ingest_members.fetch_members_for_congress", return_value=MOCK_MEMBERS)
 @patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
 @patch("pipeline.fetch_amendments_for_bill", return_value=MOCK_AMENDMENTS)
 def test_ingest_members_is_callable(mock_amendments, mock_leg, mock_members):
@@ -519,7 +519,7 @@ def test_amendments_process_once_after_bills_are_already_loaded(
     db.close()
 
 
-@patch("pipeline.fetch_members_for_congress", return_value=MOCK_MEMBERS)
+@patch("ingest_members.fetch_members_for_congress", return_value=MOCK_MEMBERS)
 @patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
 @patch("pipeline.fetch_amendments_for_bill", return_value=MOCK_AMENDMENTS)
 def test_run_ingestion_members_only(mock_amendments, mock_leg, mock_members):
@@ -542,7 +542,7 @@ def test_run_ingestion_members_only(mock_amendments, mock_leg, mock_members):
     db.close()
 
 
-@patch("pipeline.fetch_members_for_congress")
+@patch("ingest_members.fetch_members_for_congress")
 @patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
 @patch("pipeline.fetch_amendments_for_bill", return_value=MOCK_AMENDMENTS)
 def test_run_ingestion_skip_members(mock_amendments, mock_leg, mock_members):
@@ -566,7 +566,7 @@ def test_run_ingestion_skip_members(mock_amendments, mock_leg, mock_members):
     db.close()
 
 
-@patch("pipeline.fetch_members_for_congress")
+@patch("ingest_members.fetch_members_for_congress")
 @patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
 @patch("pipeline.fetch_amendments_for_bill")
 def test_run_ingestion_bills_only(mock_amendments, mock_leg, mock_members):
@@ -587,7 +587,7 @@ def test_run_ingestion_bills_only(mock_amendments, mock_leg, mock_members):
     db.close()
 
 
-@patch("pipeline.fetch_members_for_congress")
+@patch("ingest_members.fetch_members_for_congress")
 @patch("pipeline.fetch_legislation_for_member")
 @patch("pipeline.fetch_amendments_for_bill", return_value=MOCK_AMENDMENTS)
 def test_run_ingestion_amendments_only(mock_amendments, mock_leg, mock_members):
@@ -612,7 +612,7 @@ def test_run_ingestion_amendments_only(mock_amendments, mock_leg, mock_members):
     db.close()
 
 
-@patch("pipeline.fetch_members_for_congress", return_value=MOCK_SENATE_MEMBERS)
+@patch("ingest_members.fetch_members_for_congress", return_value=MOCK_SENATE_MEMBERS)
 @patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SENATE_SPONSORED_BILLS, MOCK_SENATE_COSPONSORED_BILLS))
 @patch("pipeline.fetch_amendments_for_bill", return_value=MOCK_SENATE_AMENDMENTS)
 def test_run_ingestion_senate(mock_amendments, mock_leg, mock_senate_members):
