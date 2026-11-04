@@ -136,6 +136,7 @@ def create_tables(db, replace: bool = False, replace_tables: list[str] | None = 
             member_id           VARCHAR,
             relationship        VARCHAR,
             policy_area         VARCHAR,
+            summary             VARCHAR,
             update_date         TIMESTAMP,
             row_hash            VARCHAR,
             ingested_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

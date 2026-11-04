@@ -16,9 +16,11 @@ select
     cast(congress as integer)               as congress,
     upper(trim(bill_type))                  as bill_type,
     trim(bill_number)                       as bill_number,
+    trim(policy_area)                       as bill_policy_area,
     upper(trim(bill_type))
         || '-' || trim(bill_number)         as bill_id,
     trim(title)                             as bill_title,
+    trim(summary)                           as bill_summary,
     trim(member_id)                         as member_id,
     lower(trim(relationship))               as member_relationship,  -- 'sponsor' or 'cosponsor'
     case upper(trim(bill_type))

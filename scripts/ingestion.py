@@ -240,6 +240,9 @@ def load_bills(db, bills, member_id, relationship):
         # Safely extract policyArea string using extract_policy_area helper
         policy_area = extract_policy_area(b.get("policyArea"))
 
+        # Option A: Extract CRS summary (if present in dict)
+        summary = b.get("summary")
+
         introduced_date = b.get("introducedDate")
         update_date = b.get("updateDate") or b.get("updateDateIncludingText")
 
@@ -248,23 +251,34 @@ def load_bills(db, bills, member_id, relationship):
         latest_action_date = latest_action.get("actionDate")
         latest_action_text = latest_action.get("text")
 
-        # Include policy_area in the hash calculation
+        # Include summary and policy_area in hash calculation
         row_hash = _compute_hash(
             congress, bill_type, bill_number, title, policy_area,
-            member_id, relationship, introduced_date,
+            summary, member_id, relationship, introduced_date,
             latest_action_date, latest_action_text
         )
 
         rows.append((
-            congress, bill_type, bill_number, title, policy_area,
-            introduced_date, latest_action_date, latest_action_text,
-            member_id, relationship, update_date, row_hash, now_iso
+            congress,           # [0]
+            bill_type,          # [1]
+            bill_number,        # [2]
+            title,              # [3]
+            policy_area,        # [4]
+            summary,            # [5]
+            introduced_date,    # [6]
+            latest_action_date, # [7]
+            latest_action_text, # [8]
+            member_id,          # [9]
+            relationship,       # [10]
+            update_date,        # [11]
+            row_hash,           # [12]
+            now_iso             # [13]
         ))
 
     # 1. Efficient Hash Lookup (Scope to member_id & relationship)
     existing_hashes = {
-        (congress, bill_type, bill_number): row_hash
-        for congress, bill_type, bill_number, row_hash in db.execute(
+        (c, bt, bn): h
+        for c, bt, bn, h in db.execute(
             """
             SELECT congress, bill_type, bill_number, row_hash
             FROM main.raw_bills
@@ -278,33 +292,37 @@ def load_bills(db, bills, member_id, relationship):
     inserted = updated = unchanged = 0
     for row in rows:
         key = (row[0], row[1], row[2])  # (congress, bill_type, bill_number)
+        row_hash = row[12]
         existing_hash = existing_hashes.get(key)
 
         if existing_hash is None:
             inserted += 1
-        elif existing_hash != row[11]:  # row[11] is row_hash
+        elif existing_hash != row_hash:
             updated += 1
         else:
             unchanged += 1
 
     # 3. Idempotent Upsert into DuckDB
-    db.executemany("""
-                   INSERT INTO main.raw_bills (
-                       congress, bill_type, bill_number, title, policy_area,
-                       introduced_date, latest_action_date, latest_action_text,
-                       member_id, relationship, update_date, row_hash, ingested_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                       ON CONFLICT (congress, bill_type, bill_number, member_id, relationship) DO UPDATE SET
-                       title = EXCLUDED.title,
-                                                                                                      policy_area = EXCLUDED.policy_area,
-                                                                                                      introduced_date = EXCLUDED.introduced_date,
-                                                                                                      latest_action_date = EXCLUDED.latest_action_date,
-                                                                                                      latest_action_text = EXCLUDED.latest_action_text,
-                                                                                                      update_date = EXCLUDED.update_date,
-                                                                                                      row_hash = EXCLUDED.row_hash,
-                                                                                                      ingested_at = EXCLUDED.ingested_at
-                                                                                                  WHERE main.raw_bills.row_hash != EXCLUDED.row_hash
-                   """, rows)
+    upsert_sql = """
+                 INSERT INTO main.raw_bills (
+                     congress, bill_type, bill_number, title, policy_area, summary,
+                     introduced_date, latest_action_date, latest_action_text,
+                     member_id, relationship, update_date, row_hash, ingested_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT (congress, bill_type, bill_number, member_id, relationship) DO UPDATE SET
+                     title = EXCLUDED.title,
+                                                                                                    policy_area = EXCLUDED.policy_area,
+                                                                                                    summary = COALESCE(EXCLUDED.summary, main.raw_bills.summary),
+                                                                                                    introduced_date = EXCLUDED.introduced_date,
+                                                                                                    latest_action_date = EXCLUDED.latest_action_date,
+                                                                                                    latest_action_text = EXCLUDED.latest_action_text,
+                                                                                                    update_date = EXCLUDED.update_date,
+                                                                                                    row_hash = EXCLUDED.row_hash,
+                                                                                                    ingested_at = EXCLUDED.ingested_at
+                                                                                                WHERE main.raw_bills.row_hash != EXCLUDED.row_hash \
+                 """
+
+    db.executemany(upsert_sql, rows)
 
     return {
         "total": len(rows),

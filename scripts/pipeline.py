@@ -16,10 +16,9 @@ import duckdb
 # Bounded queue and concurrency limits to prevent memory bloat and rate-limiting
 QUEUE_MAX_SIZE = 500
 NUM_AMENDMENT_WORKERS = 5
+NUM_SUMMARY_WORKERS = 5
 NUM_BILL_WORKERS = 5
 SEMAPHORE = asyncio.Semaphore(NUM_AMENDMENT_WORKERS)
-
-
 
 # Add script folder to path if executed standalone
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -28,6 +27,7 @@ from api import (
     fetch_amendments_for_bill,
     fetch_legislation_for_member,
     fetch_members_for_congress,
+    fetch_summary_for_bill,
 )
 from config import (
     ENV,
@@ -54,11 +54,7 @@ logger = logging.getLogger(__name__)
 # -- Prompt Helpers ------------------------------------------------------------
 
 def prompt_reset_tables() -> bool:
-    """
-    Prompt the user to recreate/reset raw tables.
-    Only accepts 'y', 'yes', 'n', 'no' (case-insensitive).
-    Re-prompts until valid input is given.
-    """
+    """Prompt the user to recreate/reset raw tables."""
     while True:
         choice = input("Recreate/reset raw tables? (y/n): ").strip().lower()
         if choice in ("y", "yes"):
@@ -69,10 +65,7 @@ def prompt_reset_tables() -> bool:
 
 
 def prompt_refresh_mode() -> bool:
-    """
-    Prompt the user to specify whether this is a full refresh or incremental refresh.
-    Returns True for full refresh (recreates/resets tables), False for incremental refresh (preserves existing data).
-    """
+    """Prompt the user to specify whether this is a full refresh or incremental refresh."""
     print("\nSelect refresh mode:")
     print("  1) Incremental refresh (preserve existing data, skip unchanged records)")
     print("  2) Full refresh (reset/recreate raw tables)")
@@ -89,11 +82,7 @@ def prompt_refresh_mode() -> bool:
 
 
 def prompt_ingestion_menu() -> dict | None:
-    """
-    Display interactive menu for selecting the ingestion pipeline task.
-    Returns a dict with chamber, ingestion mode, and member-source configuration,
-    or None if the user chooses to exit.
-    """
+    """Display interactive menu for selecting the ingestion pipeline task."""
     print("\n" + "=" * 55)
     print("           CONGRESS INGESTION PIPELINE")
     print("=" * 55)
@@ -137,12 +126,7 @@ def setup_database(
         reset: bool | None = None,
         reset_tables: list[str] | None = None,
 ):
-    """
-    Initialize database tables.
-    If reset is explicitly provided (True/False via CLI or interactive prompt), use it.
-    Otherwise, interactively prompt the user.
-    On a full refresh, reset only the requested raw tables.
-    """
+    """Initialize database tables."""
     if reset is None:
         should_reset = prompt_refresh_mode()
     else:
@@ -165,10 +149,10 @@ def setup_database(
 
 # -- Ingestion -----------------------------------------------------------------
 
-
-def ingest_member_bills(db, members, chamber: str = "house"):
+def ingest_member_bills(db, members, chamber: str = "house", fetch_summaries_sync: bool = False):
     """Fetch bills concurrently and serialize their DuckDB upserts on this thread."""
     unique_bills = {}
+    addColumn(db, "raw_bills", "summary", "VARCHAR")
     bill_stats = {"total": 0, "inserted": 0, "updated": 0, "unchanged": 0}
     if not members:
         print("\n-- Bill Ingestion Complete --")
@@ -202,9 +186,18 @@ def ingest_member_bills(db, members, chamber: str = "house"):
                 f"[{idx}/{len(members)}] Loaded legislation for "
                 f"{member.get('name', bid)} ({member_chamber})..."
             )
+
+            # In synchronous mode, fetch summary inline if missing
+            if fetch_summaries_sync:
+                for b in sponsored + cosponsored:
+                    if not b.get("summary"):
+                        summary_text = fetch_summary_for_bill(b.get("congress"), b.get("type"), b.get("number"))
+                        if summary_text:
+                            b["summary"] = summary_text
+
             for bills, relationship in (
-                (sponsored, "sponsor"),
-                (cosponsored, "cosponsor"),
+                    (sponsored, "sponsor"),
+                    (cosponsored, "cosponsor"),
             ):
                 stats = load_bills(db, bills, bid, relationship)
                 for stat_name in bill_stats:
@@ -242,7 +235,6 @@ def run_ingestion(
     start_time = time.time()
     chamber = (chamber or DEFAULT_CHAMBER).lower()
 
-    # Member ingestion uses the census crosswalk only to populate House GEOIDs.
     amendments_only = ingest_amendments and not ingest_bills
     if not skip_members and not amendments_only:
         if not check_tables_exist(db, ["raw_census__cd11920_county20"]):
@@ -289,11 +281,9 @@ def run_ingestion(
         fetched_amdts = 0
         skipped_amdts = 0
     else:
-        # Load existing bill timestamps for incremental change detection
         existing_bill_timestamps = get_existing_bill_timestamps(db)
 
-        # Execution Branch: Sync vs Async Engine
-        mode = "Async Streaming" if use_async and ingest_amendments else "Synchronous"
+        mode = "Async Streaming" if use_async else "Synchronous"
         print(f"\n Starting Ingestion Pipeline [{mode} Mode] (chamber={chamber})...")
 
         if use_async:
@@ -332,6 +322,101 @@ def run_ingestion(
         print(f"  {table}: {count} rows")
 
 
+# -- Workers for Async Execution -----------------------------------------------
+
+async def summary_worker(worker_id: int, queue: asyncio.Queue, db_writer_queue: asyncio.Queue):
+    """
+    Consumer Worker: Continuously pulls unique bills from the queue, fetches
+    their CRS summary text using fetch_summary_for_bill, and queues the write.
+    """
+    while True:
+        item = await queue.get()
+        if item is None:
+            queue.task_done()
+            break
+
+        congress, bill_type, bill_number = item
+        bill_ref = f"{congress}-{bill_type}-{bill_number}"
+
+        async with SEMAPHORE:
+            try:
+                summary_text = await asyncio.to_thread(
+                    fetch_summary_for_bill, congress, bill_type, bill_number
+                )
+
+                if summary_text:
+                    await db_writer_queue.put((
+                        "UPDATE_SUMMARY", congress, bill_type, bill_number, summary_text
+                    ))
+                    print(f"[Summary Worker {worker_id}] Fetched CRS summary for {bill_ref}")
+                else:
+                    print(f"[Summary Worker {worker_id}] No summary available yet for {bill_ref}")
+
+            except Exception as e:
+                print(f"[Summary Worker {worker_id}] Error fetching summary for {bill_ref}: {e}")
+            finally:
+                queue.task_done()
+
+
+async def amendment_worker(
+        worker_id: int,
+        queue: asyncio.Queue,
+        write_queue: asyncio.Queue,
+        existing_timestamps: dict,
+        stats: dict,
+):
+    """
+    Consumer Worker: Continuously pulls unique bills from the queue, fetches
+    their amendments, and hands the DB write off to db_writer_worker via write_queue.
+    """
+    while True:
+        item = await queue.get()
+        if item is None:
+            queue.task_done()
+            break
+
+        congress, bill_type, bill_number, update_date_raw = item
+        key = (congress, bill_type, bill_number)
+        bill_ref = f"{congress}-{bill_type}-{bill_number}"
+
+        current_update = parse_api_date(update_date_raw)
+        previous_update = parse_api_date(existing_timestamps.get(key))
+
+        if previous_update and current_update and current_update <= previous_update:
+            stats["skipped_amendments"] += 1
+            print(
+                f"[Worker {worker_id}] Skipping bill {bill_ref}: no changes "
+                f"(latest action {current_update}, stored {previous_update})"
+            )
+            queue.task_done()
+            continue
+
+        async with SEMAPHORE:
+            try:
+                amendments = await asyncio.to_thread(
+                    fetch_amendments_for_bill, congress, bill_type, bill_number
+                )
+
+                stats["fetched_amendments"] += 1
+                stats["bills_processed"] += 1
+                await write_queue.put((
+                    "AMENDMENTS", amendments, congress, bill_type, bill_number, update_date_raw
+                ))
+                if amendments:
+                    print(
+                        f"[Worker {worker_id}] Processed bill {bill_ref}: "
+                        f"fetched {len(amendments)} amendment(s) -> queued for write"
+                    )
+                else:
+                    stats["bills_without_amendments"] += 1
+                    print(f"[Worker {worker_id}] Processed bill {bill_ref}: no amendments found")
+
+            except Exception as e:
+                print(f"[Worker {worker_id}] Error fetching {bill_ref}: {e}")
+            finally:
+                queue.task_done()
+
+
 def run_sync_pipeline(
         db,
         members,
@@ -346,7 +431,7 @@ def run_sync_pipeline(
     unique_bills = {}
 
     if ingest_bills:
-        unique_bills = ingest_member_bills(db, members, chamber=chamber)
+        unique_bills = ingest_member_bills(db, members, chamber=chamber, fetch_summaries_sync=True)
 
     if not ingest_amendments:
         return len(unique_bills), 0, 0
@@ -441,82 +526,12 @@ def run_async_pipeline_wrapper(
         force_amendment_refresh: bool = False,
 ):
     """Wrapper to trigger asyncio event loop for async streaming engine."""
-    if not ingest_amendments:
-        return run_sync_pipeline(
-            db, members, existing_timestamps, chamber=chamber,
-            ingest_bills=ingest_bills, ingest_amendments=False,
-        )
     return asyncio.run(run_streaming_pipeline(
         db, members, existing_timestamps, chamber=chamber,
-        ingest_bills=ingest_bills, existing_bills=existing_bills,
+        ingest_bills=ingest_bills, ingest_amendments=ingest_amendments,
+        existing_bills=existing_bills,
         force_amendment_refresh=force_amendment_refresh,
     ))
-
-async def amendment_worker(
-        worker_id: int,
-        queue: asyncio.Queue,
-        write_queue: asyncio.Queue,
-        existing_timestamps: dict,
-        stats: dict,
-):
-    """
-    Consumer Worker: Continuously pulls unique bills from the queue, fetches
-    their amendments, and hands the DB write off to the single db_writer_worker
-    (which owns the DuckDB connection) via write_queue.
-    """
-    while True:
-        item = await queue.get()
-        if item is None:  # Sentinel value signaling pipeline completion
-            queue.task_done()
-            break
-
-        congress, bill_type, bill_number, update_date_raw = item
-        key = (congress, bill_type, bill_number)
-        bill_ref = f"{congress}-{bill_type}-{bill_number}"
-
-        # 1. Fast In-Memory Timestamp Delta Check
-        # update_date_raw is the bill's latestAction.actionDate; the baseline holds
-        # latest_action_date as a VARCHAR, so parse both sides to datetime.
-        current_update = parse_api_date(update_date_raw)
-        previous_update = parse_api_date(existing_timestamps.get(key))
-
-        if previous_update and current_update and current_update <= previous_update:
-            stats["skipped_amendments"] += 1
-            print(
-                f"[Worker {worker_id}] Skipping bill {bill_ref}: no changes "
-                f"(latest action {current_update}, stored {previous_update})"
-            )
-            queue.task_done()
-            continue
-
-        # 2. Fetch Amendments with Bounded Concurrency
-        # Reuse the synchronous api.py client (pagination + 429/5xx retry + 404
-        # handling) off the event loop via a thread so the loop stays responsive.
-        async with SEMAPHORE:
-            try:
-                amendments = await asyncio.to_thread(
-                    fetch_amendments_for_bill, congress, bill_type, bill_number
-                )
-
-                stats["fetched_amendments"] += 1
-                stats["bills_processed"] += 1
-                # 3. Hand off the write to the single-owner db_writer_worker
-                await write_queue.put((
-                    amendments, congress, bill_type, bill_number, update_date_raw
-                ))
-                if amendments:
-                    print(
-                        f"[Worker {worker_id}] Processed bill {bill_ref}: "
-                        f"fetched {len(amendments)} amendment(s) -> queued for write"
-                    )
-                else:
-                    stats["bills_without_amendments"] += 1
-                    print(f"[Worker {worker_id}] Processed bill {bill_ref}: no amendments found")
-
-            except Exception as e:
-                print(f"[Worker {worker_id}] Error fetching {bill_ref}: {e}")
-            finally:
-                queue.task_done()
 
 
 async def _ingest_bill_amendments_async(
@@ -525,9 +540,11 @@ async def _ingest_bill_amendments_async(
         existing_timestamps: dict,
         full_refresh: bool = False,
 ):
-    """Fetch amendments concurrently and serialize DuckDB writes."""
-    queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
+    """Fetch amendments and CRS summaries concurrently and serialize DuckDB writes."""
+    amdt_queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
+    summary_queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
     write_queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
+
     stats = {
         "bills_processed": 0,
         "bills_without_amendments": 0,
@@ -537,25 +554,39 @@ async def _ingest_bill_amendments_async(
     timestamps = {} if full_refresh else existing_timestamps
 
     writer = asyncio.create_task(db_writer_worker(db, write_queue))
-    workers = [
-        asyncio.create_task(amendment_worker(i, queue, write_queue, timestamps, stats))
+
+    amdt_workers = [
+        asyncio.create_task(amendment_worker(i, amdt_queue, write_queue, timestamps, stats))
         for i in range(NUM_AMENDMENT_WORKERS)
+    ]
+    summary_workers = [
+        asyncio.create_task(summary_worker(i, summary_queue, write_queue))
+        for i in range(NUM_SUMMARY_WORKERS)
     ]
 
     items = list(_amendment_bill_items(bills))
     for (congress, bill_type, bill_number), action_date in items:
-        await queue.put((congress, bill_type, bill_number, action_date))
+        await amdt_queue.put((congress, bill_type, bill_number, action_date))
+        await summary_queue.put((congress, bill_type, bill_number))
 
-    await queue.join()
+    # Wait for amendment tasks to complete
+    await amdt_queue.join()
     for _ in range(NUM_AMENDMENT_WORKERS):
-        await queue.put(None)
-    await asyncio.gather(*workers)
+        await amdt_queue.put(None)
+    await asyncio.gather(*amdt_workers)
 
+    # Wait for summary tasks to complete
+    await summary_queue.join()
+    for _ in range(NUM_SUMMARY_WORKERS):
+        await summary_queue.put(None)
+    await asyncio.gather(*summary_workers)
+
+    # Flush database writer
     await write_queue.join()
     await write_queue.put(None)
     await writer
 
-    print("\n-- Amendment Ingestion Complete --")
+    print("\n-- Streaming Pipeline Ingestion Complete --")
     print(f"  Bills considered: {len(items)}")
     print(f"  Bills processed: {stats['bills_processed']}")
     print(f"  Bills skipped (no changes): {stats['skipped_amendments']}")
@@ -570,14 +601,13 @@ async def run_streaming_pipeline(
         existing_timestamps,
         chamber: str = "house",
         ingest_bills: bool = True,
+        ingest_amendments: bool = True,
         existing_bills: list[tuple[int, str, str, str | None]] | None = None,
         force_amendment_refresh: bool = False,
 ):
-    """
-    Ingest bills, then fetch their amendments concurrently.
-    """
+    """Ingest bills, then fetch their amendments and CRS summaries concurrently."""
     if ingest_bills:
-        bills_to_process = ingest_member_bills(db, members, chamber=chamber)
+        bills_to_process = ingest_member_bills(db, members, chamber=chamber, fetch_summaries_sync=False)
     elif existing_bills is not None:
         bills_to_process = existing_bills
     else:
@@ -590,27 +620,24 @@ async def run_streaming_pipeline(
         full_refresh=force_amendment_refresh,
     )
 
+
 async def db_writer_worker(db, write_queue: asyncio.Queue):
     """
     Single-consumer loop that owns the DuckDB write connection.
-
-    Amendment workers hand off (amendments, congress, bill_type, bill_number)
-    tuples here so all writes are serialized through one owner. Items are
-    batched and flushed in one transaction to minimize transaction overhead.
+    Handles both amendment loading and CRS summary updates.
     """
     batch = []
 
     while True:
         item = await write_queue.get()
-        if item is None:  # Sentinel to stop worker
-            _flush_batch_to_duckdb(db, batch)  # flush any remainder before exit
+        if item is None:
+            _flush_batch_to_duckdb(db, batch)
             batch.clear()
             write_queue.task_done()
             break
 
         batch.append(item)
 
-        # Flush batch when it reaches size threshold or queue is temporarily empty
         if len(batch) >= 50 or write_queue.empty():
             _flush_batch_to_duckdb(db, batch)
             batch.clear()
@@ -619,33 +646,40 @@ async def db_writer_worker(db, write_queue: asyncio.Queue):
 
 
 def _flush_batch_to_duckdb(db, batch: list[tuple]):
-    """
-    Persist a batch of per-bill amendment payloads in a single transaction.
-
-    Each item is (amendments, congress, bill_type, bill_number, latest_action_date). Reuses
-    load_amendments so the upsert/hash logic lives in exactly one place and
-    stays in sync with the raw_amendments schema.
-    """
+    """Persist a batch of amendment and summary payloads in a single transaction."""
     if not batch:
         return
 
     db.execute("BEGIN TRANSACTION;")
     try:
-        for amendments, congress, bill_type, bill_number, latest_action_date in batch:
-            load_amendments(db, amendments, congress, bill_type, bill_number)
-            mark_bill_amendments_processed(
-                db, congress, bill_type, bill_number, latest_action_date
-            )
+        for item in batch:
+            op_type = item[0]
+            if op_type == "AMENDMENTS":
+                _, amendments, congress, bill_type, bill_number, latest_action_date = item
+                load_amendments(db, amendments, congress, bill_type, bill_number)
+                mark_bill_amendments_processed(
+                    db, congress, bill_type, bill_number, latest_action_date
+                )
+            elif op_type == "UPDATE_SUMMARY":
+                _, congress, bill_type, bill_number, summary_text = item
+                db.execute(
+                    """
+                    UPDATE main.raw_bills
+                    SET summary = ?
+                    WHERE congress = ? AND bill_type = ? AND bill_number = ?
+                    """,
+                    [summary_text, congress, bill_type, bill_number]
+                )
         db.execute("COMMIT;")
     except Exception as e:
         db.execute("ROLLBACK;")
         print(f"[DB Writer] Error flushing batch of {len(batch)}: {e}")
 
+
 def start_pipeline(args):
     member_limit = None if ENV != 'Dev' else 5
     random_sample = getattr(args, "random", False)
 
-    # Check if explicit mode/chamber CLI flags were passed
     has_explicit_cli_flags = any([
         getattr(args, "house", False),
         getattr(args, "senate", False),
@@ -654,25 +688,22 @@ def start_pipeline(args):
         getattr(args, "bills_only", False),
         getattr(args, "amendments_only", False),
         getattr(args, "skip_members", False),
-    ])
+        ])
 
     reset = getattr(args, "reset", None)
 
     if not has_explicit_cli_flags:
-        # Prompt user with the interactive menu
         selection = prompt_ingestion_menu()
         if selection is None:
-            return  # User selected Exit
+            return
         chamber = selection["chamber"]
         ingestion_mode = selection["ingestion_mode"]
         skip_members = selection["skip_members"]
 
-        # Prompt right after the menu for full refresh vs incremental refresh if not specified via CLI
         if reset is None:
             reset = prompt_refresh_mode()
 
     else:
-        # Resolve chamber configuration from CLI arguments
         chamber = DEFAULT_CHAMBER
         if getattr(args, "senate", False):
             chamber = "senate"
@@ -697,7 +728,6 @@ def start_pipeline(args):
 
     db = get_db_connection()
 
-    # Setup phase (table initialization/reset)
     reset_tables = []
     if not skip_members and ingestion_mode in ("members", "all"):
         reset_tables.append("raw_members")
@@ -706,12 +736,12 @@ def start_pipeline(args):
     if ingest_amendments:
         reset_tables.append("raw_amendments")
     full_refresh = setup_database(db, reset=reset, reset_tables=reset_tables)
-    # Ingestion phase
+
     run_ingestion(
         db,
         member_limit=member_limit,
         random_sample=random_sample,
-        use_async=getattr(args, "use_async", False),
+        use_async=getattr(args, "use_async", True),
         members_only=members_only,
         skip_members=skip_members,
         ingest_bills=ingest_bills,

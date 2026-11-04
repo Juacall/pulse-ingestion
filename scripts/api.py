@@ -215,6 +215,26 @@ def fetch_legislation_for_member(bioguide_id: str, chamber: str = "house") -> tu
     return sponsored, cosponsored
 
 
+
+def fetch_summary_for_bill(congress: int, bill_type: str, bill_number: str) -> str | None:
+    """
+    Fetches CRS summary text for a specific bill from Congress.gov API.
+    GET /v3/bill/{congress}/{billType}/{billNumber}/summaries
+    """
+    url = f"{BASE_URL}/bill/{congress}/{bill_type.lower()}/{bill_number}/summaries?api_key={API_KEY}"
+    try:
+        res = requests.get(url, timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            summaries = data.get("summaries", [])
+            if summaries:
+                # Get the latest CRS summary text (usually the last entry in the list)
+                latest = summaries[-1]
+                return latest.get("text")
+    except Exception as e:
+        logger.warning(f"Failed to fetch summary for bill {congress}-{bill_type}-{bill_number}: {e}")
+    return None
+
 def fetch_amendments_for_bill(congress: int, bill_type: str, bill_number: str) -> list:
     """
     Fetch all amendments to a bill, regardless of who sponsored them.
