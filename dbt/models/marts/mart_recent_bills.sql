@@ -11,10 +11,10 @@ WITH recent_sponsored_bills AS (
         b.bill_latest_action_date,
         b.bill_latest_action_text,
         b.member_id AS sponsor_bioguide_id,
+        COALESCE(b.chamber, m.chamber) AS chamber,
         m.name AS sponsor_name,
         m.party AS sponsor_party,
-        m.state AS sponsor_state,
-        m.chamber
+        m.state AS sponsor_state
     FROM {{ ref('stg_bills') }} b
     LEFT JOIN {{ ref('dim_politicians') }} m
 ON b.member_id = m.bioguide_id
