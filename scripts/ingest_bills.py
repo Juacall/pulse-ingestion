@@ -15,7 +15,6 @@ NUM_BILL_WORKERS = 5
 def ingest_member_bills(db, members, chamber: str = "house", fetch_summaries_sync: bool = False):
     """Fetch bills concurrently and serialize their DuckDB upserts on this thread."""
     unique_bills = {}
-    addColumn(db, "raw_bills", "summary", "VARCHAR")
     bill_stats = {"total": 0, "inserted": 0, "updated": 0, "unchanged": 0}
     if not members:
         print("\n-- Bill Ingestion Complete --")

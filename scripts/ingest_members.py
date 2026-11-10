@@ -80,7 +80,6 @@ def ingest_members(
 ):
     """Fetch current Congress members and upsert the selected chamber to raw_members."""
     chamber = (chamber or DEFAULT_CHAMBER).lower()
-    addColumn(db,"raw_members","congress","INTEGER")
 
     limit_desc = "ALL" if member_limit is None else str(member_limit)
     print(f"\nFetching {chamber} members from the Congress API (limit={limit_desc}, random={random_sample})...")

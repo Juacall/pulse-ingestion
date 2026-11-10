@@ -1,4 +1,4 @@
-﻿"""
+"""
 tests/test_ingestion_validation.py
 
 Unit and integration tests for data ingestion, schema validation, checksumming,
@@ -221,7 +221,7 @@ def test_bills_ingestion_and_relationship():
     db.close()
 
 
-@patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
+@patch("ingest_bills.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
 def test_house_bill_ingestion_logs_ingested_and_skipped_counts(mock_legislation, capsys):
     """House bill ingestion logs new rows and skips unchanged rows on rerun."""
     db = create_in_memory_db_with_seeds()
@@ -388,8 +388,8 @@ def test_cli_flags_parsing():
 
 
 @patch("ingest_members.fetch_members_for_congress", return_value=MOCK_MEMBERS)
-@patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
-@patch("pipeline.fetch_amendments_for_bill", return_value=MOCK_AMENDMENTS)
+@patch("ingest_bills.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
+@patch("ingest_amendments.fetch_amendments_for_bill", return_value=MOCK_AMENDMENTS)
 def test_ingest_members_is_callable(mock_amendments, mock_leg, mock_members):
     """The member stage can be run independently and returns ingestion stats."""
     db = create_in_memory_db_with_seeds()
@@ -405,8 +405,8 @@ def test_ingest_members_is_callable(mock_amendments, mock_leg, mock_members):
     db.close()
 
 
-@patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
-@patch("pipeline.fetch_amendments_for_bill")
+@patch("ingest_bills.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
+@patch("ingest_amendments.fetch_amendments_for_bill")
 def test_ingest_member_bills_is_callable(mock_amendments, mock_legislation):
     """The bill stage can run independently and returns distinct bills."""
     db = create_in_memory_db_with_seeds()
@@ -433,7 +433,7 @@ def test_ingest_member_bills_fetches_members_concurrently():
         both_workers_started.wait(timeout=5)
         return MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS
 
-    with patch("pipeline.fetch_legislation_for_member", side_effect=fetch_member_bills) as mock_fetch:
+    with patch("ingest_bills.fetch_legislation_for_member", side_effect=fetch_member_bills) as mock_fetch:
         bills = ingest_member_bills(db, members, chamber="house")
 
     assert len(bills) == 2
@@ -442,7 +442,7 @@ def test_ingest_member_bills_fetches_members_concurrently():
     db.close()
 
 
-@patch("pipeline.fetch_amendments_for_bill", return_value=MOCK_AMENDMENTS)
+@patch("ingest_amendments.fetch_amendments_for_bill", return_value=MOCK_AMENDMENTS)
 def test_ingest_bill_amendments_is_callable(mock_amendments):
     """Amendments can be ingested directly from stored bill rows."""
     db = create_in_memory_db_with_seeds()
@@ -462,7 +462,7 @@ def test_ingest_bill_amendments_is_callable(mock_amendments):
 
 
 @pytest.mark.parametrize("use_async", [False, True])
-@patch("pipeline.fetch_amendments_for_bill", return_value=[])
+@patch("ingest_amendments.fetch_amendments_for_bill", return_value=[])
 def test_amendment_ingestion_logs_processed_and_unchanged_bills(
         mock_amendments, use_async, capsys
 ):
@@ -490,7 +490,7 @@ def test_amendment_ingestion_logs_processed_and_unchanged_bills(
 
 
 @pytest.mark.parametrize("use_async", [False, True])
-@patch("pipeline.fetch_amendments_for_bill", return_value=[])
+@patch("ingest_amendments.fetch_amendments_for_bill", return_value=[])
 def test_amendments_process_once_after_bills_are_already_loaded(
         mock_amendments, use_async
 ):
@@ -520,8 +520,8 @@ def test_amendments_process_once_after_bills_are_already_loaded(
 
 
 @patch("ingest_members.fetch_members_for_congress", return_value=MOCK_MEMBERS)
-@patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
-@patch("pipeline.fetch_amendments_for_bill", return_value=MOCK_AMENDMENTS)
+@patch("ingest_bills.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
+@patch("ingest_amendments.fetch_amendments_for_bill", return_value=MOCK_AMENDMENTS)
 def test_run_ingestion_members_only(mock_amendments, mock_leg, mock_members):
     """Verify run_ingestion with members_only=True skips bills and amendments."""
     db = create_in_memory_db_with_seeds()
@@ -543,8 +543,8 @@ def test_run_ingestion_members_only(mock_amendments, mock_leg, mock_members):
 
 
 @patch("ingest_members.fetch_members_for_congress")
-@patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
-@patch("pipeline.fetch_amendments_for_bill", return_value=MOCK_AMENDMENTS)
+@patch("ingest_bills.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
+@patch("ingest_amendments.fetch_amendments_for_bill", return_value=MOCK_AMENDMENTS)
 def test_run_ingestion_skip_members(mock_amendments, mock_leg, mock_members):
     """Verify run_ingestion with skip_members=True pulls members from table and ingests bills/amendments."""
     db = create_in_memory_db_with_seeds()
@@ -567,8 +567,8 @@ def test_run_ingestion_skip_members(mock_amendments, mock_leg, mock_members):
 
 
 @patch("ingest_members.fetch_members_for_congress")
-@patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
-@patch("pipeline.fetch_amendments_for_bill")
+@patch("ingest_bills.fetch_legislation_for_member", return_value=(MOCK_SPONSORED_BILLS, MOCK_COSPONSORED_BILLS))
+@patch("ingest_amendments.fetch_amendments_for_bill")
 def test_run_ingestion_bills_only(mock_amendments, mock_leg, mock_members):
     """Bills-only mode writes bill records without requesting amendments."""
     db = create_in_memory_db_with_seeds()
@@ -588,8 +588,8 @@ def test_run_ingestion_bills_only(mock_amendments, mock_leg, mock_members):
 
 
 @patch("ingest_members.fetch_members_for_congress")
-@patch("pipeline.fetch_legislation_for_member")
-@patch("pipeline.fetch_amendments_for_bill", return_value=MOCK_AMENDMENTS)
+@patch("ingest_bills.fetch_legislation_for_member")
+@patch("ingest_amendments.fetch_amendments_for_bill", return_value=MOCK_AMENDMENTS)
 def test_run_ingestion_amendments_only(mock_amendments, mock_leg, mock_members):
     """Amendments-only mode reads stored bills without fetching members or bills."""
     db = create_in_memory_db_with_seeds()
@@ -613,8 +613,8 @@ def test_run_ingestion_amendments_only(mock_amendments, mock_leg, mock_members):
 
 
 @patch("ingest_members.fetch_members_for_congress", return_value=MOCK_SENATE_MEMBERS)
-@patch("pipeline.fetch_legislation_for_member", return_value=(MOCK_SENATE_SPONSORED_BILLS, MOCK_SENATE_COSPONSORED_BILLS))
-@patch("pipeline.fetch_amendments_for_bill", return_value=MOCK_SENATE_AMENDMENTS)
+@patch("ingest_bills.fetch_legislation_for_member", return_value=(MOCK_SENATE_SPONSORED_BILLS, MOCK_SENATE_COSPONSORED_BILLS))
+@patch("ingest_amendments.fetch_amendments_for_bill", return_value=MOCK_SENATE_AMENDMENTS)
 def test_run_ingestion_senate(mock_amendments, mock_leg, mock_senate_members):
     """Verify run_ingestion with chamber='senate' fetches senate members and legislation."""
     db = create_in_memory_db_with_seeds()
