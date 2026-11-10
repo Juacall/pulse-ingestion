@@ -1,5 +1,4 @@
 -- stg_members.sql
---
 -- Clean and rename raw_members.
 {{ config(materialized = 'view') }}
 
@@ -75,7 +74,9 @@ members as (
         website_url,
         campaign_url,
         image_url,
-        committee_id
+        committee_id,
+        start_year,
+        end_year
     from {{ source('congress', 'raw_members') }}
     where
         bioguide_id is not null
@@ -86,9 +87,10 @@ members as (
 select
     members.bioguide_id                       as member_id,
     trim(members.name)                        as member_name,
-    state_lookup.state_code                   as state_code,
+    coalesce(state_lookup.state_code, upper(trim(members.state)))
+                                              as state_code,
     coalesce(state_lookup.state_name, upper(trim(members.state)))
-                                                as state_name,
+                                              as state_name,
     state_lookup.state_fips                   as state_fips,
     trim(members.chamber)                     as chamber,
     cast(members.district as integer)         as district_number,
@@ -97,11 +99,17 @@ select
     members.website_url                       as website_url,
     members.campaign_url                      as campaign_url,
     members.image_url                         as image_url,
-    members.committee_id                      as committee_id
+    members.committee_id                      as committee_id,
+    cast(members.start_year as integer)       as start_year,
+    cast(members.end_year as integer)         as end_year,
+    cast(119 + floor((cast(members.start_year as integer) - 2025) / 2.0) as integer) as congress,
+    make_date(cast(members.start_year as integer), 1, 3) as start_date,
+    case
+        when members.end_year is not null
+            then make_date(cast(members.end_year as integer), 1, 3)
+        else cast(null as date)
+        end as end_date
 from members
-left join state_lookup
-    on upper(trim(cast(members.state as varchar))) in (
-        state_lookup.state_code,
-        state_lookup.state_name,
-        state_lookup.state_fips
-    )
+         left join state_lookup
+                   on upper(trim(cast(members.state as varchar))) = state_lookup.state_code
+                       or upper(trim(cast(members.state as varchar))) = state_lookup.state_name

@@ -143,11 +143,6 @@ def init_donor_tables(conn):
                  );
                  """)
 
-    addColumn(conn,"politician_fec_summary","individual_unitemized", "DOUBLE")
-    addColumn(conn,"politician_fec_summary","individual_itemized", "DOUBLE")
-    addColumn(conn,"politician_fec_summary","grassroots_percentage", "DOUBLE")
-
-
     conn.execute("""
                      CREATE TABLE IF NOT EXISTS politician_top_donors (
                                                                           politician_id VARCHAR,

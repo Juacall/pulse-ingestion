@@ -134,6 +134,15 @@ def load_candidates(db, candidates: List[Dict[str, Any]]) -> Dict[str, int]:
         "unchanged": unchanged,
     }
 
+def _safe_int(val):
+    """Safely cast year values to int or None."""
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return None
+
 def load_members(db, members):
     """
     Idempotently upsert member rows into raw_members.
@@ -155,17 +164,29 @@ def load_members(db, members):
         district = m.get("district")
         party = m.get("partyName") or m.get("party")
         geoid_cd = m.get("geoid_cd") or m.get("_geoid_cd")
-        website_url = m.get("website_url"),
+        website_url = m.get("website_url")
         image_url = m.get("image_url")
         update_date = m.get("updateDate")
 
-        row_hash = _compute_hash(bid, name, state, chamber, district, party, geoid_cd, website_url, image_url)
+        # Extract start_year and end_year (handles direct keys or nested terms payloads)
+        start_year = _safe_int(m.get("start_year") or m.get("startYear"))
+        end_year = _safe_int(m.get("end_year") or m.get("endYear"))
+        print(m)
 
-        # Tuple Order:
+        row_hash = _compute_hash(
+            bid, name, state, chamber, district, party, geoid_cd,
+            website_url, image_url, start_year, end_year
+        )
+
+        # Tuple Layout:
         # [0]: bid, [1]: name, [2]: state, [3]: chamber, [4]: district,
-        # [5]: party, [6]: geoid_cd, [7]: website_url, [8]: update_date,
-        # [9]: row_hash, [10]: now_iso
-        rows.append((bid, name, state, chamber, district, party, geoid_cd, website_url,image_url, update_date, row_hash, now_iso))
+        # [5]: party, [6]: geoid_cd, [7]: website_url, [8]: image_url,
+        # [9]: start_year, [10]: end_year, [11]: update_date, [12]: row_hash, [13]: now_iso
+        rows.append((
+            bid, name, state, chamber, district, party, geoid_cd,
+            website_url, image_url, start_year, end_year, update_date,
+            row_hash, now_iso
+        ))
 
     # Classify each incoming row against stored records
     existing_hashes = {}
@@ -182,7 +203,7 @@ def load_members(db, members):
 
     inserted = updated = unchanged = 0
     for r in rows:
-        bid, new_hash = r[0], r[10]
+        bid, new_hash = r[0], r[12]
         if bid not in existing_hashes:
             inserted += 1
         elif existing_hashes[bid] != new_hash:
@@ -192,8 +213,10 @@ def load_members(db, members):
 
     db.executemany("""
                    INSERT INTO main.raw_members (
-                       bioguide_id, name, state, chamber, district, party, geoid_cd, website_url,  image_url, update_date, row_hash, ingested_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       bioguide_id, name, state, chamber, district, party, geoid_cd,
+                       website_url, image_url, start_year, end_year, update_date,
+                       row_hash, ingested_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT (bioguide_id) DO UPDATE SET
                        name = EXCLUDED.name,
                                                         state = EXCLUDED.state,
@@ -203,6 +226,8 @@ def load_members(db, members):
                                                         geoid_cd = EXCLUDED.geoid_cd,
                                                         website_url = EXCLUDED.website_url,
                                                         image_url = EXCLUDED.image_url,
+                                                        start_year = EXCLUDED.start_year,
+                                                        end_year = EXCLUDED.end_year,
                                                         update_date = EXCLUDED.update_date,
                                                         row_hash = EXCLUDED.row_hash,
                                                         ingested_at = EXCLUDED.ingested_at

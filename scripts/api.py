@@ -147,6 +147,10 @@ def fetch_members_for_congress(
 
         latest_term = term_items[-1] if term_items and isinstance(term_items[-1], dict) else {}
         latest_chamber = latest_term.get("chamber") or member.get("chamber")
+        lastest_start_year = latest_term.get("startYear")
+        lastest_end_year = latest_term.get("endYear")
+        member["start_year"] = lastest_start_year
+        member["end_year"] = lastest_end_year
         district = member.get("district")
         is_senate = latest_chamber == "Senate" or (
             district is None and latest_chamber != "House of Representatives"

@@ -86,7 +86,7 @@ sources:
           /member/{id}/cosponsored-legislation.
         columns:
           - name: congress
-            description: Congress number (119).
+            description: Congress number.
           - name: bill_type
             description: Bill type code (HR, HRES, HJRES, HCONRES).
           - name: bill_number

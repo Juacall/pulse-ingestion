@@ -10,7 +10,7 @@ with member_activity as (
     group by member_id
 ),
 
--- 1. Deduplicate sitting members: Exactly 1 row per member_id
+-- 1. Deduplicate sitting members: Pick the most recent record deterministically
 deduped_members as (
     select
         member_id,
@@ -21,11 +21,17 @@ deduped_members as (
         district_number,
         party_name,
         geoid_cd,
+        congress,
         website_url,
         campaign_url,
-        image_url
+        image_url,
+        start_year,
+        end_year
     from {{ ref('stg_members') }}
-    qualify row_number() over (partition by member_id order by member_id) = 1
+    qualify row_number() over (
+        partition by member_id
+        order by congress desc, start_year desc nulls last
+    ) = 1
 ),
 
 -- 2. Deduplicate FEC mapping: Exactly 1 candidate mapping per bioguide_id
@@ -34,6 +40,7 @@ deduped_fec_map as (
         bioguide_id,
         max(fec_candidate_id) as fec_candidate_id
     from {{ source('congress', 'member_fec_candidate_mapping') }}
+    where mapping_status = 'MATCHED' or fec_candidate_id is not null
     group by bioguide_id
 ),
 
@@ -67,7 +74,7 @@ deduped_candidates as (
     ) = 1
 )
 
--- INCUMBENTS (Members)
+-- INCUMBENTS (Sitting Members)
 select
     members.member_id as id,
     members.member_id as bioguide_id,
@@ -75,6 +82,7 @@ select
     members.committee_id as committee_id,
     members.member_name as name,
     members.state_code as state,
+    members.congress as congress,
     members.chamber as chamber,
     members.district_number as district,
     members.party_name as party,
@@ -84,6 +92,9 @@ select
     members.image_url as imageUrl,
     true as is_incumbent,
     'Incumbent' as status,
+
+    members.start_year as start_year,
+    members.end_year as end_year,
 
     coalesce(activity.sponsored_count, 0) as sponsored_count,
     coalesce(activity.cosponsored_count, 0) as cosponsored_count,
@@ -112,7 +123,7 @@ from deduped_members as members
 
 union all
 
--- CHALLENGERS (Candidates)
+-- CHALLENGERS (Candidates competing for seats)
 select
     candidates.candidate_id as id,
     cast(null as varchar) as bioguide_id,
@@ -120,6 +131,7 @@ select
     candidates.committee_id as committee_id,
     candidates.candidate_name as name,
     candidates.state_code as state,
+    cast(0 as integer) as congress,
     candidates.chamber as chamber,
     candidates.district_number as district,
     candidates.party_name as party,
@@ -128,7 +140,10 @@ select
     candidates.campaign_url as campaign,
     cast(null as varchar) as imageUrl,
     false as is_incumbent,
-    'Candidate' as status,
+    'Challenger' as status,
+
+    cast(null as integer) as start_year,
+    cast(null as integer) as end_year,
 
     0 as sponsored_count,
     0 as cosponsored_count,
@@ -141,9 +156,8 @@ select
 from deduped_candidates as candidates
          left join deduped_fec_summary as s
                    on candidates.candidate_id = s.fec_candidate_id
-where coalesce(candidates.challenge_code, '') != 'I'
-  and candidates.candidate_id not in (
-      select fec_candidate_id
-      from deduped_fec_map
-      where fec_candidate_id is not null
-  )
+where not exists (
+    select 1
+    from deduped_fec_map m
+    where m.fec_candidate_id = candidates.candidate_id
+)

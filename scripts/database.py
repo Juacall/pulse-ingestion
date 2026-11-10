@@ -119,6 +119,8 @@ def create_tables(db, replace: bool = False, replace_tables: list[str] | None = 
             committee_id  VARCHAR,
             update_date   TIMESTAMP,
             row_hash      VARCHAR,
+            start_year    INTEGER,
+            end_year      INTEGER,
             ingested_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (bioguide_id)
             
@@ -139,6 +141,7 @@ def create_tables(db, replace: bool = False, replace_tables: list[str] | None = 
             summary             VARCHAR,
             update_date         TIMESTAMP,
             row_hash            VARCHAR,
+            congress            INTEGER,
             ingested_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (congress, bill_type, bill_number, member_id, relationship)
         )

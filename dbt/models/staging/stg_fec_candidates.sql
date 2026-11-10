@@ -1,23 +1,26 @@
 -- models/staging/stg_fec_candidates.sql
 {{ config(materialized='view') }}
 
-select
+SELECT
     candidate_id,
-    name                as candidate_name,
-    state               as state_code,
-    chamber,
-    district            as district_number,
-    party               as party_name,
+    name                AS candidate_name,
+    state               AS state_code,
+    -- Standardize chamber representation
+    CASE
+        WHEN UPPER(TRIM(chamber)) IN ('H', 'HOUSE') THEN 'House'
+        WHEN UPPER(TRIM(chamber)) IN ('S', 'SENATE') THEN 'Senate'
+        ELSE chamber
+        END AS chamber,
+    LPAD(COALESCE(district, '00'), 2, '0') AS district_number,
+    party               AS party_name,
     geoid_cd,
     campaign_url,
     committee_id,
     candidate_status,
-    incumbent_challenge as challenge_code,
+    UPPER(TRIM(incumbent_challenge)) AS challenge_code, -- 'I' = Incumbent, 'C' = Challenger, 'O' = Open Seat
     election_year,
     fec_update_date,
     first_file_date,
     row_hash,
     ingested_at
-from {{ source('congress', 'raw_fec_candidates') }}
--- Exclude Incumbents ('I') because they are already ingested via stg_members
-where coalesce(incumbent_challenge, '') != 'I'
+FROM {{ source('congress', 'raw_fec_candidates') }}

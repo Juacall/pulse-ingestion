@@ -13,7 +13,7 @@ from config import (
     DEFAULT_CHAMBER,
     MEMBER_LIMIT as DEFAULT_MEMBER_LIMIT,
 )
-from database import get_district_geoids
+from database import get_district_geoids, addColumn
 from ingestion import load_members
 
 STATE_NAME_TO_CODE = {
@@ -80,6 +80,7 @@ def ingest_members(
 ):
     """Fetch current Congress members and upsert the selected chamber to raw_members."""
     chamber = (chamber or DEFAULT_CHAMBER).lower()
+    addColumn(db,"raw_members","congress","INTEGER")
 
     limit_desc = "ALL" if member_limit is None else str(member_limit)
     print(f"\nFetching {chamber} members from the Congress API (limit={limit_desc}, random={random_sample})...")

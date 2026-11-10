@@ -1,51 +1,64 @@
+-- models/marts/fct_elections.sql
 {{ config(materialized='table') }}
 
-with candidate_races as (
+WITH candidate_races AS (
     -- 1. Contests generated from active challenger / open-seat filings
-    select
-        election_year as election_cycle,
+    SELECT
+        election_year AS election_cycle,
         state_code,
-        case
-            when upper(trim(chamber)) in ('H', 'HOUSE') then 'H'
-            when upper(trim(chamber)) in ('S', 'SENATE') then 'S'
-            else upper(trim(chamber))
-        end as office_code,
-        lpad(coalesce(district_number, '00'), 2, '0') as district
-    from {{ ref('stg_fec_candidates') }}
-    where state_code is not null
-      and chamber is not null
+        CASE
+            WHEN UPPER(TRIM(chamber)) IN ('H', 'HOUSE') THEN 'H'
+            WHEN UPPER(TRIM(chamber)) IN ('S', 'SENATE') THEN 'S'
+            ELSE UPPER(TRIM(chamber))
+        END AS office_code,
+        LPAD(COALESCE(district_number, '00'), 2, '0') AS district
+    FROM {{ ref('stg_fec_candidates') }}
+    WHERE state_code IS NOT NULL
+      AND chamber IS NOT NULL
 
-    union
+    UNION
 
     -- 2. Contests generated from sitting incumbents in dim_politicians
-    select
-        2026 as election_cycle,
-        state as state_code,
-        case
-            when upper(trim(chamber)) in ('H', 'HOUSE') then 'H'
-            when upper(trim(chamber)) in ('S', 'SENATE') then 'S'
-            else upper(trim(chamber))
-        end as office_code,
-        lpad(coalesce(district, '00'), 2, '0') as district
-    from {{ ref('dim_politicians') }}
-    where is_incumbent = true
-      and state is not null
-      and chamber is not null
+    SELECT
+        2026 AS election_cycle,
+        state AS state_code,
+        CASE
+            WHEN UPPER(TRIM(chamber)) IN ('H', 'HOUSE') THEN 'H'
+            WHEN UPPER(TRIM(chamber)) IN ('S', 'SENATE') THEN 'S'
+            ELSE UPPER(TRIM(chamber))
+        END AS office_code,
+        LPAD(COALESCE(district, '00'), 2, '0') AS district
+    FROM {{ ref('dim_politicians') }}
+    WHERE is_incumbent = TRUE
+      AND state IS NOT NULL
+      AND chamber IS NOT NULL
+),
+
+formatted_races AS (
+    SELECT DISTINCT
+        election_cycle,
+        state_code,
+        CASE
+            WHEN office_code = 'H' THEN 'House'
+            WHEN office_code = 'S' THEN 'Senate'
+            ELSE office_code
+        END AS office_sought,
+        district,
+        -- Construct seat_id matching dim_seats conventions
+        CASE
+            WHEN office_code = 'H' THEN CONCAT(state_code, '-H-', district)
+            -- For Senate, map to seat_id or default to state level
+            ELSE CONCAT(state_code, '-S-1')
+        END AS seat_id
+    FROM candidate_races
 )
 
-select distinct
-    concat(
-            election_cycle, '_',
-            state_code, '_',
-            office_code, '_',
-            district
-    ) as election_id,
+SELECT
+    CONCAT(election_cycle, '_', state_code, '_', IF(office_sought = 'House', 'H', 'S'), '_', district) AS election_id,
+    seat_id,
     election_cycle,
     state_code,
-    case
-        when office_code = 'H' then 'House'
-        when office_code = 'S' then 'Senate'
-        else office_code
-        end as office_sought,
-    district
-from candidate_races
+    office_sought,
+    district,
+    'Certified' AS status
+FROM formatted_races
