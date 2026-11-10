@@ -3,61 +3,36 @@ import csv
 import json
 import logging
 import os
-import re
 import sys
-import time
 from pathlib import Path
 
-import httpx
-import requests
 
 from config import API_KEY
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from database import get_db_connection, addColumn
+from api import (
+    DONOR_CYCLE,
+    OpenFECRateLimitError,
+    OpenFECRequestTimeoutError,
+    _candidate_name_identity,
+    _normalize_district,
+    fetch_candidate_committee_report_summary,
+    fetch_candidate_committees,
+    fetch_fec_candidate_mapping,
+    fetch_fec_candidate_summaries,
+    fetch_fec_candidates_by_ids,
+    fetch_top_pac_contributors,
+)
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = BASE_DIR / "dev.duckdb"
 LOG_PATH = BASE_DIR / "logs" / "openfec_ingestion.log"
 CROSSWALK_PATH = BASE_DIR / "dbt" / "seeds" / "legislators_current.csv"
-FEC_BASE_URL = "https://api.open.fec.gov/v1"
-DONOR_CYCLE = 2026
 DONOR_SYNC_MAX_AGE_DAYS = int(os.getenv("DONOR_SYNC_MAX_AGE_DAYS", "7"))
 FEC_MAPPING_MAX_AGE_DAYS = int(os.getenv("FEC_MAPPING_MAX_AGE_DAYS", "90"))
-FEC_REQUEST_INTERVAL_SECONDS = max(
-    0.0, float(os.getenv("FEC_REQUEST_INTERVAL_SECONDS", "4"))
-)
 SUMMARY_BATCH_SIZE = 50
 FEC_MAPPING_BATCH_SIZE = 50
-NON_COMPANY_EMPLOYERS = {
-    "ENTREPRENEUR",
-    "HOMEMAKER",
-    "INFORMATIONREQUESTED",
-    "INFORMATIONREQUESTEDPERBESTEFFORTS",
-    "NA",
-    "NONE",
-    "NOTEMPLOYED",
-    "NULL",
-    "RETIRED",
-    "SELF",
-    "SELFEMPLOYED",
-}
-_last_fec_request_at = None
-
-
-class OpenFECRateLimitError(RuntimeError):
-    def __init__(self, endpoint: str, retry_after: str | None = None):
-        super().__init__(f"OpenFEC rate limit reached at {endpoint}.")
-        self.endpoint = endpoint
-        self.retry_after = retry_after
-        self.context = "context unavailable"
-
-
-class OpenFECRequestTimeoutError(RuntimeError):
-    def __init__(self, endpoint: str):
-        super().__init__(f"OpenFEC request timed out at {endpoint}.")
-        self.endpoint = endpoint
-        self.context = "context unavailable"
 
 
 def _get_ingestion_logger():
@@ -91,18 +66,6 @@ def _with_rate_limit_context(operation, context):
     except (OpenFECRateLimitError, OpenFECRequestTimeoutError) as error:
         error.context = context
         raise
-
-
-def _pace_fec_request():
-    """Keep successive OpenFEC request starts at least the configured interval apart."""
-    global _last_fec_request_at
-    now = time.monotonic()
-    if _last_fec_request_at is not None:
-        remaining = FEC_REQUEST_INTERVAL_SECONDS - (now - _last_fec_request_at)
-        if remaining > 0:
-            time.sleep(remaining)
-            now = time.monotonic()
-    _last_fec_request_at = now
 
 
 def get_fec_api_key() -> str:
@@ -144,15 +107,16 @@ def init_donor_tables(conn):
                  """)
 
     conn.execute("""
-                     CREATE TABLE IF NOT EXISTS politician_top_donors (
-                                                                          politician_id VARCHAR,
-                                                                          donor_name VARCHAR,
-                                                                          amount DOUBLE,
-                                                                          industry VARCHAR,
-                                                                          cycle VARCHAR,
-                                                                          PRIMARY KEY (politician_id, donor_name, cycle)
-                         )
-                     """)
+                 CREATE TABLE IF NOT EXISTS politician_top_donors (
+                                                                      politician_id VARCHAR,
+                                                                      donor_name VARCHAR,
+                                                                      amount DOUBLE,
+                                                                      donor_type VARCHAR, -- 'EMPLOYER_AGGREGATE' or 'PAC'
+                                                                      industry VARCHAR,
+                                                                      cycle VARCHAR,
+                                                                      PRIMARY KEY (politician_id, donor_name, donor_type, cycle)
+                     )
+                 """)
     conn.execute("""
                  CREATE TABLE IF NOT EXISTS politician_fec_sync_state (
                                                                           politician_id VARCHAR,
@@ -181,173 +145,22 @@ def init_donor_tables(conn):
         )
     """)
 
-
-def _get_fec_response(endpoint: str, params: dict):
-    """Request an OpenFEC endpoint without exposing the API key in HTTP errors."""
-    _pace_fec_request()
-    try:
-        response = httpx.get(
-            f"{FEC_BASE_URL}/{endpoint.lstrip('/')}",
-            params=params,
-            timeout=60,
-        )
-    except httpx.TimeoutException as error:
-        raise OpenFECRequestTimeoutError(endpoint) from error
-    if response.is_error:
-        if response.status_code == 429:
-            raise OpenFECRateLimitError(
-                endpoint, response.headers.get("Retry-After")
-            )
-        raise RuntimeError(
-            f"OpenFEC request failed with HTTP {response.status_code} at {endpoint}."
-        )
-    return response
-
-
-def _normalize_name(name: str | None) -> str:
-    return re.sub(r"[^A-Z0-9]", "", (name or "").upper())
-
-
-def _candidate_name_identity(name: str | None) -> tuple[str, str]:
-    """Extract normalized surname and first name from FEC/member name formats."""
-    parts = (name or "").upper().split(",", maxsplit=1)
-    if len(parts) == 2:
-        surname = _normalize_name(parts[0])
-        given_names = re.findall(r"[A-Z]+", parts[1])
-        first_name = given_names[0] if given_names else ""
-        return surname, first_name
-
-    parts = re.findall(r"[A-Z]+", (name or "").upper())
-    if len(parts) < 2:
-        return "", ""
-    return _normalize_name(parts[-1]), parts[0]
-
-
-def _normalize_district(district) -> int | None:
-    if district is None or str(district).strip() == "":
-        return None
-    try:
-        return int(district)
-    except (TypeError, ValueError):
-        return None
-
-
-def fetch_fec_candidate_mapping(
-    bioguide_id: str,
-    name: str,
-    state: str,
-    chamber: str,
-    district: int | None,
-    api_key: str,
-) -> dict:
-    """Broaden candidate search and accept only a unique name/office/state match."""
-    office = {"house": "H", "senate": "S"}.get(chamber.strip().casefold())
-    if office is None:
-        raise ValueError(f"Unsupported chamber for FEC mapping: {chamber}")
-
-    name_variants = [name]
-    if "," in name:
-        surname, given_names = name.split(",", maxsplit=1)
-        given_tokens = re.findall(r"[A-Za-z]+", given_names)
-        if given_tokens:
-            name_variants.append(f"{given_tokens[0]} {surname.strip()}")
-        name_variants.append(surname.strip())
-
-    candidates_by_id = {}
-    expected_identity = _candidate_name_identity(name)
-    for query in dict.fromkeys(variant.strip() for variant in name_variants if variant.strip()):
-        response = _get_fec_response(
-            "candidates/search/",
-            [
-                ("api_key", api_key),
-                ("q", query),
-                ("state", state.upper()),
-                ("office", office),
-                ("cycle", DONOR_CYCLE),
-                ("per_page", 100),
-                ("sort", "-receipts"),
-            ],
-        )
-        for candidate in response.json().get("results", []):
-            candidate_id = candidate.get("candidate_id")
-            if candidate_id:
-                candidates_by_id[candidate_id] = candidate
-
-        identity_matches = [
-            candidate
-            for candidate in candidates_by_id.values()
-            if _candidate_name_identity(candidate.get("name")) == expected_identity
-            and str(candidate.get("office") or "").upper() == office
-            and str(candidate.get("state") or "").upper() == state.upper()
-        ]
-        if identity_matches:
-            break
-
-    candidates = list(candidates_by_id.values())
-    options = [
-        {
-            "candidate_id": candidate.get("candidate_id"),
-            "name": candidate.get("name"),
-            "office": candidate.get("office"),
-            "state": candidate.get("state"),
-            "district": candidate.get("district"),
-        }
-        for candidate in candidates
-    ]
-    identity_matches = [
-        candidate
-        for candidate in candidates
-        if _candidate_name_identity(candidate.get("name")) == expected_identity
-        and str(candidate.get("office") or "").upper() == office
-        and str(candidate.get("state") or "").upper() == state.upper()
-    ]
-    district_matches = [
-        candidate
-        for candidate in identity_matches
-        if office != "H"
-        or _normalize_district(candidate.get("district")) == district
-    ]
-    matches = district_matches or identity_matches
-
-    if len(matches) == 1:
-        candidate = matches[0]
-        status = "MATCHED"
-        candidate_district = _normalize_district(candidate.get("district"))
-        if office == "H" and candidate_district != district:
-            reason = (
-                "Unique normalized first/last name, office, and state match; "
-                "candidate district differs or was changed by redistricting."
-            )
-        else:
-            reason = "Unique normalized first/last name, office, state, and district match."
-    elif len(matches) > 1:
-        candidate = None
-        status = "AMBIGUOUS"
-        reason = "Multiple FEC candidates match the member's name, office, and state."
-    else:
-        candidate = None
-        status = "NOT_FOUND"
-        reason = (
-            "No unique normalized first/last name, office, and state match."
-            if candidates
-            else "OpenFEC returned no candidate search results."
-        )
-
-    return {
-        "bioguide_id": bioguide_id,
-        "member_name": name,
-        "state_code": state.upper(),
-        "chamber": chamber,
-        "district_number": district,
-        "fec_candidate_id": candidate.get("candidate_id") if candidate else None,
-        "fec_candidate_name": candidate.get("name") if candidate else None,
-        "fec_office": candidate.get("office") if candidate else None,
-        "fec_state": candidate.get("state") if candidate else None,
-        "fec_district": candidate.get("district") if candidate else None,
-        "mapping_status": status,
-        "mapping_reason": reason,
-        "candidate_options": json.dumps(options),
-    }
+    conn.execute("""
+                 CREATE VIEW IF NOT EXISTS v_global_top_donors_leaderboard AS
+                 SELECT
+                     d.donor_name,
+                     d.donor_type,
+                     d.cycle,
+                     SUM(d.amount) AS total_amount_contributed,
+                     COUNT(DISTINCT d.politician_id) AS politicians_funded,
+                     -- Get the politician who received the most money from this donor
+                     MAX_BY(p.name, d.amount) AS top_recipient_name,
+                     MAX(d.amount) AS top_recipient_amount
+                 FROM politician_top_donors d
+                          JOIN dim_politicians p ON d.politician_id = p.id
+                 GROUP BY d.donor_name, d.donor_type, d.cycle
+                 ORDER BY total_amount_contributed DESC;
+                 """)
 
 
 def load_legislator_fec_crosswalk(
@@ -380,25 +193,6 @@ def load_legislator_fec_crosswalk(
                 )
             )
     return crosswalk
-
-
-def fetch_fec_candidates_by_ids(
-    fec_candidate_ids: list[str], api_key: str, cycle: int = DONOR_CYCLE
-) -> list[dict]:
-    """Fetch current-cycle candidate records for IDs provided by the crosswalk."""
-    if not fec_candidate_ids:
-        return []
-
-    response = _get_fec_response(
-        "candidates/",
-        [
-            ("api_key", api_key),
-            ("cycle", cycle),
-            ("per_page", min(len(fec_candidate_ids), 100)),
-            *(("candidate_id", candidate_id) for candidate_id in fec_candidate_ids),
-        ],
-    )
-    return response.json().get("results", [])
 
 
 def _mapping_from_crosswalk_candidates(member, fec_candidate_ids, candidates):
@@ -476,36 +270,6 @@ def _mapping_from_crosswalk_candidates(member, fec_candidate_ids, candidates):
     }
 
 
-def fetch_candidate_committees(
-        fec_candidate_id: str, api_key: str, cycle: int = DONOR_CYCLE
-) -> tuple[list[dict], dict | None]:
-    """Fetch non-joint-fundraising committees and extract primary campaign metadata."""
-    response = _get_fec_response(
-        f"candidate/{fec_candidate_id}/committees/",
-        {"api_key": api_key, "cycle": cycle, "per_page": 100},
-    )
-
-    committees = {}
-    primary_info = None
-
-    for row in response.json().get("results", []):
-        committee_id = row.get("committee_id")
-        designation = row.get("designation")
-
-        # Capture non-joint-fundraising committees for donor aggregation
-        if committee_id and designation != "J":
-            committees[committee_id] = row
-
-        # Capture principal campaign committee ('P') details
-        if designation == "P" and primary_info is None:
-            primary_info = {
-                "committee_id": committee_id,
-                "campaign_url": row.get("website"),
-            }
-
-
-    return list(committees.values()), primary_info
-
 def _persist_committee_info(
         conn, politician_id: str, is_incumbent: bool, committee_info: dict | None
 ):
@@ -536,184 +300,6 @@ def _persist_committee_info(
             """,
             [campaign_url, committee_id, politician_id],
         )
-
-def fetch_candidate_committee_ids(
-    fec_candidate_id: str, api_key: str, cycle: int = DONOR_CYCLE
-) -> list[str]:
-    """Fetch candidate committee IDs, excluding joint fundraising committees."""
-    return [
-        committee["committee_id"]
-        for committee in fetch_candidate_committees(
-            fec_candidate_id, api_key, cycle
-        )
-    ]
-
-
-def fetch_candidate_committee_report_summary(
-    fec_candidate_id: str, api_key: str, cycle: int = DONOR_CYCLE
-) -> dict | None:
-    """Build a fallback summary from each committee's latest cycle filing."""
-    committees = fetch_candidate_committees(fec_candidate_id, api_key, cycle)
-    committee_summaries = []
-    for committee in committees:
-        committee_id = committee["committee_id"]
-        response = _get_fec_response(
-            f"committee/{committee_id}/reports/",
-            [
-                ("api_key", api_key),
-                ("cycle", cycle),
-                ("per_page", 100),
-                ("sort", "-receipt_date"),
-            ],
-        )
-        reports = [
-            report
-            for report in response.json().get("results", [])
-            if report.get("most_recent") is True
-        ]
-        if not reports:
-            continue
-
-        latest_report = max(
-            reports,
-            key=lambda report: (
-                str(report.get("coverage_end_date") or ""),
-                str(report.get("receipt_date") or ""),
-            ),
-        )
-        if latest_report.get("total_receipts_ytd") is not None:
-            committee_summaries.append(latest_report)
-
-    if not committee_summaries:
-        return None
-
-    coverage_dates = [
-        str(report["coverage_end_date"])[:10]
-        for report in committee_summaries
-        if report.get("coverage_end_date")
-    ]
-    return {
-        "total_receipts": sum(
-            float(report.get("total_receipts_ytd") or 0)
-            for report in committee_summaries
-        ),
-        "pac_contributions": sum(
-            float(report.get("other_political_committee_contributions_ytd") or 0)
-            for report in committee_summaries
-        ),
-        "individual_contributions": sum(
-            float(report.get("individual_itemized_contributions_ytd") or 0)
-            for report in committee_summaries
-        ),
-        "coverage_end_date": min(coverage_dates) if coverage_dates else None,
-        "summary_source": "committee_reports",
-    }
-
-
-def fetch_top_pac_contributors(
-    fec_candidate_id: str, api_key: str, cycle: int = DONOR_CYCLE
-) -> list[dict]:
-    """Fetch top employer aggregates from the candidate's committees."""
-    committee_ids, primary_committee_info = fetch_candidate_committee_ids(
-        fec_candidate_id, api_key, cycle
-    )
-    if not committee_ids:
-        return [], primary_committee_info
-
-    response = _get_fec_response(
-        "schedules/schedule_a/by_employer/",
-        [
-            ("api_key", api_key),
-            ("cycle", cycle),
-            ("sort", "-total"),
-            ("per_page", 100),
-            *(("committee_id", committee_id) for committee_id in committee_ids),
-        ],
-    )
-    totals_by_employer = {}
-    for row in response.json().get("results", []):
-        employer = row.get("employer")
-        donor_name = employer.strip() if isinstance(employer, str) else ""
-        employer_category = re.sub(r"[^A-Z0-9]", "", donor_name.upper())
-        if not donor_name or employer_category in NON_COMPANY_EMPLOYERS:
-            continue
-        donor_name = donor_name.title()
-        amount = float(row.get("total") or 0.0)
-        totals_by_employer[donor_name] = totals_by_employer.get(donor_name, 0.0) + amount
-
-    top_employers = sorted(
-        totals_by_employer.items(), key=lambda item: item[1], reverse=True
-    )[:5]
-
-
-    donors = [
-        {
-            "donor_name": donor_name,
-            "amount": amount,
-            "industry": "Employer aggregate",
-        }
-        for donor_name, amount in top_employers]
-    return donors, primary_committee_info
-
-
-def fetch_fec_candidate_summaries(
-        fec_candidate_ids: list[str], api_key: str, cycle: int = DONOR_CYCLE
-) -> dict[str, dict]:
-    """Fetch summary totals for multiple candidates in a single OpenFEC request."""
-    if not fec_candidate_ids:
-        return {}
-
-    response = _get_fec_response(
-        "candidates/totals/",
-        [
-            ("api_key", api_key),
-            ("cycle", cycle),
-            ("per_page", max(len(fec_candidate_ids), 20)),
-            *(("candidate_id", candidate_id) for candidate_id in fec_candidate_ids),
-        ],
-    )
-    summaries = {}
-    for row in response.json().get("results", []):
-        candidate_id = row.get("candidate_id")
-        if candidate_id:
-            total_receipts = float(row.get("receipts") or row.get("total_receipts") or 0.0)
-
-            # Line 11a(i): > $200 (Itemized)
-            itemized = float(row.get("individual_itemized_contributions") or 0.0)
-
-            # Line 11a Total: Total Individual Contributions
-            total_indiv = float(row.get("individual_contributions") or 0.0)
-
-            # Line 11a(ii): <= $200 (Grassroots Unitemized)
-            # Derived as: Total Individual - Itemized Individual
-            if "individual_unitemized_contributions" in row and row["individual_unitemized_contributions"] is not None:
-                unitemized = float(row["individual_unitemized_contributions"])
-            elif total_indiv >= itemized and total_indiv > 0:
-                unitemized = total_indiv - itemized
-            else:
-                # Secondary fallback if individual_contributions is omitted in OpenFEC payload
-                pac_contribs = float(row.get("other_political_committee_contributions") or 0.0)
-                transfers = float(row.get("transfers_from_other_authorized_committee") or 0.0)
-                unitemized = max(0.0, total_receipts - (itemized + pac_contribs + transfers))
-                total_indiv = itemized + unitemized
-
-            # Line 11c: PACs
-            pac_contribs = float(row.get("other_political_committee_contributions") or 0.0)
-
-            # Grassroots share percentage calculation
-            grassroots_pct = round((unitemized / total_receipts * 100), 2) if total_receipts > 0 else 0.0
-
-            summaries[candidate_id] = {
-                "total_receipts": total_receipts,
-                "pac_contributions": pac_contribs,
-                "individual_contributions": total_indiv,
-                "individual_itemized": itemized,       # > $200
-                "individual_unitemized": unitemized,   # <= $200 (Grassroots)
-                "grassroots_percentage": grassroots_pct,
-                "coverage_end_date": row.get("coverage_end_date"),
-                "summary_source": "candidate_totals",
-            }
-    return summaries
 
 def _mark_synced(conn, table, politician_ids):
     for pol_id in politician_ids:
