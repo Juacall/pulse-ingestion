@@ -112,7 +112,13 @@ def update_views(conn, md_db: str, source_db: str = "local_db"):
         pending = failed
 
 
-if __name__ == "__main__":
+def sync_motherduck():
+    """Sync the local database to MotherDuck."""
+    if not os.environ.get("MOTHERDUCK_TOKEN"):
+        raise SystemExit("MOTHERDUCK_TOKEN is not set in .env")
+    if not LOCAL_DB_PATH.exists():
+        raise SystemExit(f"Local database not found: {LOCAL_DB_PATH}")
+
     conn = duckdb.connect("md:")
     conn.execute(f"CREATE DATABASE IF NOT EXISTS {MD_DATABASE}")
     conn.execute(f"USE {MD_DATABASE}")
@@ -130,3 +136,7 @@ if __name__ == "__main__":
     conn.execute("DETACH local_db")
     conn.close()
     print(f"Successfully synced MotherDuck database ({MD_DATABASE}).")
+
+
+if __name__ == "__main__":
+    sync_motherduck()

@@ -81,6 +81,51 @@ def parse_args():
         action="store_true",
         help="Fetch amendments for bills already stored in raw_bills.",
     )
+    ingestion_group.add_argument(
+        "--votes",
+        action="store_true",
+        help="Bulk ingest Voteview member votes (see --start-congress/--end-congress).",
+    )
+    ingestion_group.add_argument(
+        "--elections",
+        action="store_true",
+        help="Ingest 2026 elections and candidate slates.",
+    )
+    ingestion_group.add_argument(
+        "--running-candidates",
+        action="store_true",
+        help="Ingest FEC running candidates.",
+    )
+    ingestion_group.add_argument(
+        "--fec",
+        nargs="?",
+        const="both",
+        choices=["both", "summaries", "donors", "mappings", "summary-cross-check"],
+        default=None,
+        help="Ingest OpenFEC donor data; optional mode (default: both).",
+    )
+    ingestion_group.add_argument(
+        "--sync-motherduck",
+        action="store_true",
+        help="Sync the local database to MotherDuck.",
+    )
+    parser.add_argument(
+        "--start-congress",
+        type=int,
+        default=116,
+        help="First Congress for --votes (default: 116).",
+    )
+    parser.add_argument(
+        "--end-congress",
+        type=int,
+        default=119,
+        help="Last Congress for --votes (default: 119).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="With --fec: refresh data even if recently synced.",
+    )
     parser.add_argument(
         "--skip-members",
         action="store_true",

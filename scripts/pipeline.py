@@ -82,7 +82,12 @@ def prompt_ingestion_menu() -> dict | None:
     print("  5) Senate Bills Only")
     print("  6) Senate Amendments Only")
     print("  7) All (Both Chambers - Members, Bills & Amendments)")
-    print("  8) Exit")
+    print("  8) Member Votes (Voteview)")
+    print("  9) 2026 Elections")
+    print(" 10) Running Candidates (FEC)")
+    print(" 11) FEC Donors & Summaries")
+    print(" 12) Sync to MotherDuck")
+    print(" 13) Exit")
     print("=" * 55)
 
     options = {
@@ -93,18 +98,23 @@ def prompt_ingestion_menu() -> dict | None:
         "5": {"chamber": "senate", "ingestion_mode": "bills", "skip_members": True, "label": "Senate Bills Only"},
         "6": {"chamber": "senate", "ingestion_mode": "amendments", "skip_members": True, "label": "Senate Amendments Only"},
         "7": {"chamber": "both", "ingestion_mode": "all", "skip_members": False, "label": "All (Both Chambers - Members, Bills & Amendments)"},
+        "8": {"pipeline": "votes", "label": "Member Votes (Voteview)"},
+        "9": {"pipeline": "elections", "label": "2026 Elections"},
+        "10": {"pipeline": "candidates", "label": "Running Candidates (FEC)"},
+        "11": {"pipeline": "fec", "label": "FEC Donors & Summaries"},
+        "12": {"pipeline": "motherduck", "label": "Sync to MotherDuck"},
     }
 
     while True:
-        choice = input("Enter choice [1-8]: ").strip().lower()
+        choice = input("Enter choice [1-13]: ").strip().lower()
         if choice in options:
             selected = options[choice]
             print(f"Selected: {selected['label']}")
             return selected
-        elif choice in ("8", "q", "quit", "exit"):
+        elif choice in ("13", "q", "quit", "exit"):
             print("Exiting pipeline.")
             return None
-        print("Invalid choice. Please enter a number from 1 to 8 (or 'q' to exit).")
+        print("Invalid choice. Please enter a number from 1 to 13 (or 'q' to exit).")
 
 
 # -- Setup ---------------------------------------------------------------------
@@ -315,9 +325,51 @@ async def run_streaming_pipeline(
     )
 
 
+def run_standalone_pipeline(name: str, args=None):
+    """Run one of the non-congress ingestion pipelines by name."""
+    # Imported lazily so each pipeline's dependencies load only when selected
+    if name == "votes":
+        from ingest_member_votes import bulk_ingest_votes
+        bulk_ingest_votes(
+            start_congress=getattr(args, "start_congress", 116),
+            end_congress=getattr(args, "end_congress", 119),
+        )
+    elif name == "elections":
+        from ingest_elections import ingest_2026_elections
+        ingest_2026_elections()
+    elif name == "candidates":
+        from ingest_running_candidates import ingest_candidates
+        ingest_candidates()
+    elif name == "fec":
+        from ingest_donate_details import run_fec_ingestion
+        run_fec_ingestion(
+            mode=getattr(args, "fec", None) or "both",
+            force=getattr(args, "force", False),
+        )
+    elif name == "motherduck":
+        from sync_motherduck import sync_motherduck
+        sync_motherduck()
+    else:
+        raise ValueError(f"Unknown pipeline: {name}")
+
+
 def start_pipeline(args):
     member_limit = None if ENV != 'Dev' else 5
     random_sample = getattr(args, "random", False)
+
+    standalone = next(
+        (name for name, active in (
+            ("votes", getattr(args, "votes", False)),
+            ("elections", getattr(args, "elections", False)),
+            ("candidates", getattr(args, "running_candidates", False)),
+            ("fec", getattr(args, "fec", None) is not None),
+            ("motherduck", getattr(args, "sync_motherduck", False)),
+        ) if active),
+        None,
+    )
+    if standalone:
+        run_standalone_pipeline(standalone, args)
+        return
 
     has_explicit_cli_flags = any([
         getattr(args, "house", False),
@@ -334,6 +386,9 @@ def start_pipeline(args):
     if not has_explicit_cli_flags:
         selection = prompt_ingestion_menu()
         if selection is None:
+            return
+        if "pipeline" in selection:
+            run_standalone_pipeline(selection["pipeline"], args)
             return
         chamber = selection["chamber"]
         ingestion_mode = selection["ingestion_mode"]
