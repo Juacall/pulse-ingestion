@@ -3,7 +3,7 @@ pulse_backend:
   outputs:
     dev:
       type: duckdb
-      path: ../dev.duckdb
+      path: "{{ env_var('DBT_DUCKDB_PATH', '../dev.duckdb') }}"
       threads: 4
     prod:
       type: duckdb

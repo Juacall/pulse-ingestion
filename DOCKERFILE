@@ -1,0 +1,29 @@
+# 1. Grab official uv binary
+FROM ghcr.io/astral-sh/uv:latest AS uv_bin
+
+# 2. Base image matching requires-python >= 3.13
+FROM python:3.13-slim
+
+# Copy uv binaries into path
+COPY --from=uv_bin /uv /uvx /bin/
+
+WORKDIR /app
+
+# Enable bytecode compilation and optimize memory
+ENV UV_COMPILE_BYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Copy project & lock files first for Docker layer caching
+COPY pyproject.toml uv.lock ./
+
+# Install all dependencies into the environment without installing the root package yet
+RUN uv sync --frozen --no-install-project
+
+# Copy project source files, scripts, dbt directories, etc.
+COPY . .
+
+# Run the prod job; select the pipeline with the PIPELINE env var (e.g. fec) or by overriding args.
+ENV ENV=prod \
+    DBT_TARGET_PATH=/tmp/dbt_target \
+    DBT_LOG_PATH=/tmp/dbt_logs
+CMD ["uv", "run", "python", "scripts/prod_job.py"]

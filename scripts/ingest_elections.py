@@ -4,7 +4,7 @@ import duckdb
 import logging
 from pathlib import Path
 from config import DB_PATH
-
+from database import ensure_primary_key
 BASE_DIR = Path(__file__).resolve().parents[1]
 
 LOG_PATH = BASE_DIR / "logs" / "openfec_ingestion.log"
@@ -83,6 +83,8 @@ def ingest_2026_elections():
     results = response.json().get("results", [])
 
     conn = duckdb.connect(str(DB_PATH))
+    ensure_primary_key(conn, "fct_elections", ["election_id"])
+    ensure_primary_key(conn, "fct_race_candidates", ["race_candidate_id"])
 
     for cand in results:
         cand_id = cand.get("candidate_id")

@@ -60,3 +60,4 @@ models:
         description: Date the bill was introduced, from the Congress.gov API.
   - name: politician_fec_summary
     description: Financial Summary Data
+  - name: stg_fec_independent_expenditures

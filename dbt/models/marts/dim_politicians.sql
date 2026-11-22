@@ -34,26 +34,7 @@ deduped_members as (
     ) = 1
 ),
 
--- 2. Deduplicate FEC mapping: Exactly 1 candidate mapping per bioguide_id
-deduped_fec_map as (
-    select
-        bioguide_id,
-        max(fec_candidate_id) as fec_candidate_id
-    from {{ source('congress', 'member_fec_candidate_mapping') }}
-    where mapping_status = 'MATCHED' or fec_candidate_id is not null
-    group by bioguide_id
-),
-
--- 3. Deduplicate FEC summary: Exactly 1 financial aggregate row per fec_candidate_id
-deduped_fec_summary as (
-    select
-        fec_candidate_id,
-        max(total_receipts) as total_receipts
-    from {{ source('congress', 'politician_fec_summary') }}
-    group by fec_candidate_id
-),
-
--- 4. Deduplicate candidates: Strictly 1 row per candidate_id
+-- 2. Deduplicate candidates: Strictly 1 row per candidate_id from bulk staging
 deduped_candidates as (
     select
         candidate_id,
@@ -72,6 +53,69 @@ deduped_candidates as (
         partition by candidate_id
         order by first_file_date desc nulls last
     ) = 1
+),
+
+-- 3. Strict 1-to-1 matching between Incumbents and FEC Candidates
+-- Matches on State + Chamber + District + Last Name + First Name prefix (handles "First Last" vs "LAST, FIRST")
+candidate_member_matches as (
+    select
+        m.member_id,
+        c.candidate_id as fec_candidate_id,
+        row_number() over (
+            partition by m.member_id
+            order by
+                case when m.committee_id is not null and m.committee_id = c.committee_id then 0 else 1 end,
+                case when c.challenge_code = 'I' then 0 else 1 end,
+                c.first_file_date desc nulls last,
+                c.candidate_id desc
+        ) as member_rn,
+        row_number() over (
+            partition by c.candidate_id
+            order by
+                case when m.committee_id is not null and m.committee_id = c.committee_id then 0 else 1 end,
+                case when c.challenge_code = 'I' then 0 else 1 end,
+                m.congress desc,
+                m.member_id asc
+        ) as candidate_rn
+    from deduped_members m
+    inner join deduped_candidates c
+        on (
+            -- Direct committee_id match (exact 100% certainty)
+            (m.committee_id is not null and trim(m.committee_id) != '' and trim(m.committee_id) = trim(c.committee_id))
+            or (
+                upper(trim(m.state_code)) = upper(trim(c.state_code))
+                and upper(trim(m.chamber)) = upper(trim(c.chamber))
+                and (
+                    upper(trim(m.chamber)) = 'SENATE'
+                    or lpad(coalesce(trim(cast(m.district_number as varchar)), '00'), 2, '0')
+                     = lpad(coalesce(trim(cast(c.district_number as varchar)), '00'), 2, '0')
+                )
+                and upper(trim(split_part(c.candidate_name, ',', 1))) = upper(trim(
+                    case
+                        when strpos(m.member_name, ',') > 0 then split_part(m.member_name, ',', 1)
+                        else split_part(regexp_replace(m.member_name, '\s+(Jr\.?|Sr\.?|II|III|IV)$', '', 'i'), ' ', -1)
+                    end
+                ))
+            )
+        )
+),
+
+inferred_fec_map as (
+    select
+        member_id,
+        fec_candidate_id
+    from candidate_member_matches
+    where member_rn = 1
+      and candidate_rn = 1
+),
+
+-- 4. Deduplicate FEC summary: Exactly 1 financial aggregate row per fec_candidate_id
+deduped_fec_summary as (
+    select
+        fec_candidate_id,
+        max(total_receipts) as total_receipts
+    from {{ source('congress', 'politician_fec_summary') }}
+    group by fec_candidate_id
 )
 
 -- INCUMBENTS (Sitting Members)
@@ -116,14 +160,14 @@ select
 from deduped_members as members
          left join member_activity as activity
                    on members.member_id = activity.member_id
-         left join deduped_fec_map as fec_map
-                   on members.member_id = fec_map.bioguide_id
+         left join inferred_fec_map as fec_map
+                   on members.member_id = fec_map.member_id
          left join deduped_fec_summary as s
                    on fec_map.fec_candidate_id = s.fec_candidate_id
 
 union all
 
--- CHALLENGERS (Candidates competing for seats)
+-- CHALLENGERS (Candidates competing for seats who are not incumbents)
 select
     candidates.candidate_id as id,
     cast(null as varchar) as bioguide_id,
@@ -140,7 +184,7 @@ select
     candidates.campaign_url as campaign,
     cast(null as varchar) as imageUrl,
     false as is_incumbent,
-    'Challenger' as status,
+    'Candidate' as status,
 
     cast(null as integer) as start_year,
     cast(null as integer) as end_year,
@@ -158,6 +202,6 @@ from deduped_candidates as candidates
                    on candidates.candidate_id = s.fec_candidate_id
 where not exists (
     select 1
-    from deduped_fec_map m
+    from inferred_fec_map m
     where m.fec_candidate_id = candidates.candidate_id
 )

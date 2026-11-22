@@ -49,8 +49,8 @@ def parse_args():
     parser.add_argument(
         "--reset",
         action="store_true",
-        default=None,
-        help="Force table recreation/reset without prompting.",
+        default=False,
+        help="Full refresh (default is incremental): keep tables but re-pull and rewrite every record, skipping row-hash checks.",
     )
     parser.add_argument(
         "--no-reset",
@@ -110,9 +110,14 @@ def parse_args():
         help="Sync the local database to MotherDuck.",
     )
     parser.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="Skip the dbt rebuild, MotherDuck sync, and cache invalidation after ingestion.",
+    )
+    parser.add_argument(
         "--start-congress",
         type=int,
-        default=116,
+        default=119,
         help="First Congress for --votes (default: 116).",
     )
     parser.add_argument(

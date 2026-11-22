@@ -132,16 +132,7 @@ def init_fec_db(db):
                    );
                """)
 
-    db.execute(""" DELETE FROM main.dim_politicians
-                   WHERE is_incumbent = FALSE
-                     AND (total_receipts IS NULL OR total_receipts < 5000);
 
-    -- Purge orphan donor records
-    DELETE FROM stg_fec_candidates
-    WHERE politician NOT IN (SELECT fec_candidate_id FROM main.dim_politicians);
-
-
-               """)
 
 
 
@@ -237,7 +228,7 @@ def ingest_candidates():
             "api_key": api_key,
             "election_year": ELECTION_YEAR,
             "candidate_status": "C",
-            "incumbent_challenge": ["C", "O"],  # Challengers and Open seats only
+            "incumbent_challenge": ["I","C","O"],  # Challengers and Open seats only
             "office": ["H", "S"],
             "per_page": 100,
             "page": page,

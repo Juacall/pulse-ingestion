@@ -23,29 +23,18 @@ logger = logging.getLogger(__name__)
 
 def get_db_connection(db_path: Path = DB_PATH, read_only: bool = False):
     # """Connect to MotherDuck; the local file is used only when ALLOW_LOCAL_DB_FALLBACK is true."""
-    # token = os.getenv("MOTHERDUCK_TOKEN")
-    # database_name = os.getenv("MOTHERDUCK_DB_NAME") or "pulse_prod"
-    # if token:
-    #     logger.info("Using MotherDuck database '%s'.", database_name)
-    #     # The token is read from MOTHERDUCK_TOKEN by DuckDB, so it never appears in the URL
-    #     conn = duckdb.connect(f"md:{database_name}")
-    #     if read_only:
-    #         conn.execute("SET custom_user_agent='legipulse-fastapi-read';")
-    #     return conn
-    #
-    # fallback_allowed = os.getenv("ALLOW_LOCAL_DB_FALLBACK", "").strip().lower() in {"1", "true", "yes"}
-    # if not fallback_allowed:
-    #     message = (
-    #         "MOTHERDUCK_TOKEN is not set and ALLOW_LOCAL_DB_FALLBACK is not enabled. "
-    #         f"Set MOTHERDUCK_TOKEN, or set ALLOW_LOCAL_DB_FALLBACK=true to use {db_path}."
-    #     )
-    #     logger.error(message)
-    #     raise RuntimeError(message)
-    #
-    # logger.warning(
-    #     "MOTHERDUCK_TOKEN is not set; ALLOW_LOCAL_DB_FALLBACK is enabled, using local database %s.",
-    #     db_path,
-    # )
+    # PULSE_FORCE_LOCAL keeps a prod job working on its hydrated local file; it syncs to MotherDuck afterwards.
+    if os.getenv("ENV") == "prod" and os.getenv("PULSE_FORCE_LOCAL") != "1":
+        token = os.getenv("MOTHERDUCK_TOKEN")
+        database_name = "pulse_prod"
+        if token:
+            logger.info("Using MotherDuck database '%s'.", database_name)
+            # The token is read from MOTHERDUCK_TOKEN by DuckDB, so it never appears in the URL
+            conn = duckdb.connect(f"md:{database_name}")
+            if read_only:
+                conn.execute("SET custom_user_agent='legipulse-fastapi-read';")
+            return conn
+
     return duckdb.connect(str(db_path), read_only=read_only)
 
 
@@ -82,6 +71,81 @@ def dropColumn(db, table_name: str, column_name: str):
     db.execute(query)
 
 
+RAW_TABLE_KEYS = {
+    "raw_members": ["bioguide_id"],
+    "raw_bills": ["congress", "bill_type", "bill_number", "member_id", "relationship"],
+    "raw_amendments": ["congress", "bill_type", "bill_number", "amendment_number", "amendment_type"],
+    "bill_amendment_ingestion_state": ["congress", "bill_type", "bill_number"],
+}
+
+
+def _set_aside_tables_without_primary_key(db, table_keys: dict[str, list[str]] | None = None) -> list[str]:
+    """Rename tables that lost their primary key (e.g. copied with CREATE TABLE AS) so they can be rebuilt."""
+    set_aside = []
+    for table in table_keys or RAW_TABLE_KEYS:
+        exists = db.execute(
+            "SELECT count(*) FROM duckdb_tables() WHERE database_name = current_database() "
+            "AND schema_name = 'main' AND table_name = ?", [table]).fetchone()[0]
+        has_key = db.execute(
+            "SELECT count(*) FROM duckdb_constraints() WHERE database_name = current_database() "
+            "AND schema_name = 'main' AND table_name = ? AND constraint_type = 'PRIMARY KEY'",
+            [table]).fetchone()[0]
+        if exists and not has_key:
+            db.execute(f'ALTER TABLE main."{table}" RENAME TO "{table}__nopk"')
+            set_aside.append(table)
+    return set_aside
+
+
+def _restore_set_aside_rows(db, tables: list[str], table_keys: dict[str, list[str]] | None = None):
+    table_keys = table_keys or RAW_TABLE_KEYS
+    for table in tables:
+        keys = ", ".join(table_keys[table])
+        db.execute(
+            f'INSERT INTO main."{table}" BY NAME '
+            f'SELECT * FROM (SELECT DISTINCT ON ({keys}) * FROM main."{table}__nopk") '
+            "ON CONFLICT DO NOTHING"
+        )
+        db.execute(f'DROP TABLE main."{table}__nopk"')
+        print(f"Rebuilt {table} with its primary key.")
+
+
+def ensure_primary_key(db, table: str, keys: list[str]) -> bool:
+    """Rebuild ``main.<table>`` with a primary key if it lacks one; returns True when rebuilt.
+
+    Tables copied with CREATE TABLE AS (MotherDuck hydrate/sync) lose their keys, which makes
+    ``ON CONFLICT`` upserts fail. DuckDB cannot add a key afterwards, so the table is recreated
+    with the same columns and the rows are copied back.
+    """
+    exists = db.execute(
+        "SELECT count(*) FROM duckdb_tables() WHERE database_name = current_database() "
+        "AND schema_name = 'main' AND table_name = ?", [table]).fetchone()[0]
+    has_key = db.execute(
+        "SELECT count(*) FROM duckdb_constraints() WHERE database_name = current_database() "
+        "AND schema_name = 'main' AND table_name = ? AND constraint_type = 'PRIMARY KEY'",
+        [table]).fetchone()[0]
+    if not exists or has_key:
+        return False
+
+    columns = db.execute(
+        "SELECT column_name, data_type, column_default FROM duckdb_columns() "
+        "WHERE database_name = current_database() AND schema_name = 'main' AND table_name = ? "
+        "ORDER BY column_index", [table]).fetchall()
+    definitions = [
+        f'"{name}" {data_type}' + (f" DEFAULT {default}" if default else "")
+        for name, data_type, default in columns
+    ]
+    key_list = ", ".join(f'"{k}"' for k in keys)
+    db.execute(f'ALTER TABLE main."{table}" RENAME TO "{table}__nopk"')
+    db.execute(f'CREATE TABLE main."{table}" ({", ".join(definitions)}, PRIMARY KEY ({key_list}))')
+    db.execute(
+        f'INSERT INTO main."{table}" BY NAME '
+        f'SELECT * FROM (SELECT DISTINCT ON ({key_list}) * FROM main."{table}__nopk")'
+    )
+    db.execute(f'DROP TABLE main."{table}__nopk"')
+    print(f"Rebuilt {table} with its primary key.")
+    return True
+
+
 def create_tables(db, replace: bool = False, replace_tables: list[str] | None = None):
     """
     Initialize raw tables in DuckDB with primary keys and checksum/timestamp tracking.
@@ -103,6 +167,18 @@ def create_tables(db, replace: bool = False, replace_tables: list[str] | None = 
     def create_stmt(table_name: str) -> str:
         should_replace = replace and table_name in tables_to_replace
         return "CREATE OR REPLACE TABLE" if should_replace else "CREATE TABLE IF NOT EXISTS"
+
+    set_aside = _set_aside_tables_without_primary_key(db)
+
+    db.execute(f"""
+               CREATE TABLE IF NOT EXISTS main.etl_watermarks (
+                                                                  pipeline_name VARCHAR PRIMARY KEY,
+                                                                  last_watermark VARCHAR NOT NULL,      -- ISO timestamp, integer ID, or dataset_hash
+                                                                  records_processed BIGINT DEFAULT 0,
+                                                                  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+               )
+    
+    """)
 
     db.execute(f"""
         {create_stmt("raw_members")} main.raw_members (
@@ -141,7 +217,6 @@ def create_tables(db, replace: bool = False, replace_tables: list[str] | None = 
             summary             VARCHAR,
             update_date         TIMESTAMP,
             row_hash            VARCHAR,
-            congress            INTEGER,
             ingested_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (congress, bill_type, bill_number, member_id, relationship)
         )
@@ -180,6 +255,7 @@ def create_tables(db, replace: bool = False, replace_tables: list[str] | None = 
             PRIMARY KEY (congress, bill_type, bill_number)
         )
     """)
+    _restore_set_aside_rows(db, set_aside)
 
     db.execute(f"""
             -- Track execution lifecycle

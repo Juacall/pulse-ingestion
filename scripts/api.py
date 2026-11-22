@@ -12,6 +12,8 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 import sys
 import time
+import io
+import zipfile
 
 import httpx
 import requests
@@ -529,21 +531,19 @@ def fetch_candidate_committees(
 
 def fetch_candidate_committee_ids(
     fec_candidate_id: str, api_key: str, cycle: int = DONOR_CYCLE
-) -> list[str]:
-    """Fetch candidate committee IDs, excluding joint fundraising committees."""
-    return [
-        committee["committee_id"]
-        for committee in fetch_candidate_committees(
-            fec_candidate_id, api_key, cycle
-        )
-    ]
+) -> tuple[list[str], dict | None]:
+    """Fetch candidate committee IDs (excluding joint fundraising) and primary committee info."""
+    committees, primary_info = fetch_candidate_committees(
+        fec_candidate_id, api_key, cycle
+    )
+    return [committee["committee_id"] for committee in committees], primary_info
 
 
 def fetch_candidate_committee_report_summary(
     fec_candidate_id: str, api_key: str, cycle: int = DONOR_CYCLE
 ) -> dict | None:
     """Build a fallback summary from each committee's latest cycle filing."""
-    committees = fetch_candidate_committees(fec_candidate_id, api_key, cycle)
+    committees, _ = fetch_candidate_committees(fec_candidate_id, api_key, cycle)
     committee_summaries = []
     for committee in committees:
         committee_id = committee["committee_id"]
@@ -704,3 +704,75 @@ def fetch_fec_candidate_summaries(
                 "summary_source": "candidate_totals",
             }
     return summaries
+
+def fetch_top_contributors_all(
+        fec_candidate_id: str, api_key: str, cycle: int = DONOR_CYCLE
+) -> list[dict]:
+    """Fetch top employer aggregates (Itemized Individuals) AND direct PAC contributions."""
+    committee_ids, primary_committee_info = fetch_candidate_committee_ids(
+        fec_candidate_id, api_key, cycle
+    )
+    if not committee_ids:
+        return [], primary_committee_info
+
+    donors = []
+
+    # 1. Fetch Top Employer Aggregates (Corporate / Employee Aggregates)
+    emp_response = _get_fec_response(
+        "schedules/schedule_a/by_employer/",
+        [
+            ("api_key", api_key),
+            ("cycle", cycle),
+            ("sort", "-total"),
+            ("per_page", 100), # Expanded to 100 to capture deeper donor coverage
+            *(("committee_id", cid) for cid in committee_ids),
+        ],
+    )
+    for row in emp_response.json().get("results", []):
+        employer = row.get("employer")
+        donor_name = employer.strip() if isinstance(employer, str) else ""
+        employer_category = re.sub(r"[^A-Z0-9]", "", donor_name.upper())
+        if not donor_name or employer_category in NON_COMPANY_EMPLOYERS:
+            continue
+
+        donors.append({
+            "donor_name": donor_name.title(),
+            "amount": float(row.get("total") or 0.0),
+            "donor_type": "EMPLOYER_AGGREGATE",
+            "industry": "Corporate / Employee Aggregate",
+        })
+
+    # 2. Fetch Top PAC / Political Committee Donors (Schedule A by Contributor Committee)
+    pac_response = _get_fec_response(
+        "schedules/schedule_a/by_contributor/",
+        [
+            ("api_key", api_key),
+            ("cycle", cycle),
+            ("is_individual", "false"), # Filters specifically for PACs/Committees
+            ("sort", "-total"),
+            ("per_page", 100),
+            *(("committee_id", cid) for cid in committee_ids),
+        ],
+    )
+    for row in pac_response.json().get("results", []):
+        name = row.get("contributor_name") or row.get("committee_name")
+        if name:
+            donors.append({
+                "donor_name": name.title(),
+                "amount": float(row.get("total") or 0.0),
+                "donor_type": "PAC",
+                "industry": "PAC / Political Committee",
+            })
+
+    return donors, primary_committee_info
+
+def fetch_zip_csv_text(url: str) -> str:
+    """Download zip in memory and return content of the inner text file as a latin-1 decoded string."""
+    print(f"Downloading bulk file from {url}...")
+    response = httpx.get(url, follow_redirects=True, timeout=60.0)
+    response.raise_for_status()
+
+    with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+        inner_filename = z.namelist()[0]
+        # FEC bulk files use latin-1 encoding, avoiding UTF-8 decode errors
+        return z.read(inner_filename).decode("latin-1")

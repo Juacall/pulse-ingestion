@@ -2,20 +2,22 @@
 import os
 import re
 from pathlib import Path
-
+import requests
 import duckdb
 from dotenv import load_dotenv
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 LOCAL_DB_PATH = ROOT_DIR / "dev.duckdb"
-MD_DATABASE = "pulse_prod"
 
 load_dotenv(ROOT_DIR / ".env")
 
-if not os.environ.get("MOTHERDUCK_TOKEN"):
-    raise SystemExit("MOTHERDUCK_TOKEN is not set in .env")
-if not LOCAL_DB_PATH.exists():
-    raise SystemExit(f"Local database not found: {LOCAL_DB_PATH}")
+
+if os.environ.get("ENV") == "dev":
+    MD_DATABASE = "pulse_dev"
+    BACKEND_URL  = os.environ.get("DEV_SERVER_URL")
+else:
+    MD_DATABASE = "pulse_prod"
+    BACKEND_URL  = os.environ.get("PROD_SERVER_URL")
 
 
 def get_table_hash(conn, db_name: str, table_name: str) -> str:
@@ -41,8 +43,10 @@ def get_table_hash(conn, db_name: str, table_name: str) -> str:
     res = conn.execute(query).fetchone()[0]
     return str(res) if res is not None else ""
 
-def update_tables(conn, md_db: str, source_db: str = "local_db", force_overwrite: bool = False):
+def update_tables(conn, md_db: str, source_db: str = "local_db", force_overwrite: bool = False,
+                  exclude_tables: set[str] | None = None):
     """Syncs updated tables from local_db to target MotherDuck database using differential hashing."""
+    exclude_tables = exclude_tables or set()
     # Exclude all dbt test artifacts and internal metadata
     tables = [
         r[0]
@@ -57,6 +61,8 @@ def update_tables(conn, md_db: str, source_db: str = "local_db", force_overwrite
     ]
 
     for name in tables:
+        if name in exclude_tables:
+            continue
         target_exists = conn.execute(
             "SELECT count(*) FROM duckdb_tables() WHERE database_name = ? "
             "AND schema_name = 'main' AND table_name = ?",
@@ -112,8 +118,8 @@ def update_views(conn, md_db: str, source_db: str = "local_db"):
         pending = failed
 
 
-def sync_motherduck():
-    """Sync the local database to MotherDuck."""
+def sync_motherduck(exclude_tables: set[str] | None = None):
+    """Sync the local database to MotherDuck, optionally skipping some tables."""
     if not os.environ.get("MOTHERDUCK_TOKEN"):
         raise SystemExit("MOTHERDUCK_TOKEN is not set in .env")
     if not LOCAL_DB_PATH.exists():
@@ -128,7 +134,8 @@ def sync_motherduck():
     conn.execute(f"ATTACH '{LOCAL_DB_PATH}' AS local_db (READ_ONLY)")
 
     # Perform table sync using hash checks
-    update_tables(conn, md_db=MD_DATABASE, source_db="local_db", force_overwrite=False)
+    update_tables(conn, md_db=MD_DATABASE, source_db="local_db", force_overwrite=False,
+                  exclude_tables=exclude_tables)
 
     # Perform view sync
     update_views(conn, md_db=MD_DATABASE, source_db="local_db")
@@ -136,6 +143,30 @@ def sync_motherduck():
     conn.execute("DETACH local_db")
     conn.close()
     print(f"Successfully synced MotherDuck database ({MD_DATABASE}).")
+
+
+def notify_cache_invalidation(prefix: str) -> bool:
+    """Invalidate the API cache for a prefix; returns True on success."""
+    if not BACKEND_URL:
+        print("⚠️ Backend URL (DEV_SERVER_URL / PROD_SERVER_URL) is not set; skipping cache invalidation.")
+        return False
+    api_url = BACKEND_URL + "/api/internal/cache/invalidate"
+    headers = {"x-internal-token": os.getenv("INTERNAL_API_SECRET", "super-secret-internal-key")}
+
+    try:
+        res = requests.post(api_url, headers=headers, params={"prefix": f"{prefix}" }, timeout=30)
+        if res.status_code == 200:
+            body = res.json()  # Parse the JSON dictionary returned by FastAPI
+            print(f"Status Code: {res.status_code}")
+
+            print(f"Keys Invalidated: {body.get('keys_invalidated', 0)}")
+            print("✅ Successfully invalidated analytical cache in Redis.")
+            return True
+        print(f"⚠️ Invalidation request failed: {res.status_code} - {res.text}")
+    except Exception as err:
+        print(f"⚠️ Could not reach API cache invalidation endpoint: {err}")
+    return False
+
 
 
 if __name__ == "__main__":

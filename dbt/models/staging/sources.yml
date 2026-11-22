@@ -137,3 +137,6 @@ sources:
       - name: member_fec_candidate_mapping
       - name: politician_top_donors
       - name: politician_fec_summary
+      - name: stg_fec_independent_expenditures
+      - name: mart_member_attendance
+      - name: mart_party_loyalty

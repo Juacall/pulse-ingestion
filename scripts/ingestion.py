@@ -16,6 +16,20 @@ def _compute_hash(*values) -> str:
     return hashlib.md5(payload.encode("utf-8")).hexdigest()
 
 
+# When set (full refresh), upserts rewrite every row instead of skipping rows whose hash is unchanged.
+_force_rewrite = False
+
+
+def set_force_rewrite(enabled: bool) -> None:
+    global _force_rewrite
+    _force_rewrite = enabled
+
+
+def _changed_only(condition: str) -> str:
+    """Return the ON CONFLICT ... WHERE clause, or nothing when a full refresh forces rewrites."""
+    return "" if _force_rewrite else f"WHERE {condition}"
+
+
 def extract_policy_area(raw_policy_area) -> str:
     """Safely extracts the policy area name from dicts, JSON strings, or None values."""
     if not raw_policy_area:
@@ -38,6 +52,9 @@ def extract_policy_area(raw_policy_area) -> str:
 def load_candidates(db, candidates: List[Dict[str, Any]]) -> Dict[str, int]:
     if not candidates:
         return {"total": 0, "inserted": 0, "updated": 0, "unchanged": 0}
+
+    from database import ensure_primary_key
+    ensure_primary_key(db, "raw_fec_candidates", ["candidate_id"])
 
     now_iso = datetime.now(timezone.utc).isoformat()
     rows = []
@@ -171,7 +188,6 @@ def load_members(db, members):
         # Extract start_year and end_year (handles direct keys or nested terms payloads)
         start_year = _safe_int(m.get("start_year") or m.get("startYear"))
         end_year = _safe_int(m.get("end_year") or m.get("endYear"))
-        print(m)
 
         row_hash = _compute_hash(
             bid, name, state, chamber, district, party, geoid_cd,
@@ -211,7 +227,7 @@ def load_members(db, members):
         else:
             unchanged += 1
 
-    db.executemany("""
+    db.executemany(f"""
                    INSERT INTO main.raw_members (
                        bioguide_id, name, state, chamber, district, party, geoid_cd,
                        website_url, image_url, start_year, end_year, update_date,
@@ -231,8 +247,7 @@ def load_members(db, members):
                                                         update_date = EXCLUDED.update_date,
                                                         row_hash = EXCLUDED.row_hash,
                                                         ingested_at = EXCLUDED.ingested_at
-                                                    WHERE main.raw_members.row_hash IS NULL
-                                                       OR main.raw_members.row_hash != EXCLUDED.row_hash
+                                                    {_changed_only("main.raw_members.row_hash IS NULL OR main.raw_members.row_hash != EXCLUDED.row_hash")}
                    """, rows)
 
     return {
@@ -328,7 +343,7 @@ def load_bills(db, bills, member_id, relationship):
             unchanged += 1
 
     # 3. Idempotent Upsert into DuckDB
-    upsert_sql = """
+    upsert_sql = f"""
                  INSERT INTO main.raw_bills (
                      congress, bill_type, bill_number, title, policy_area, summary,
                      introduced_date, latest_action_date, latest_action_text,
@@ -344,7 +359,7 @@ def load_bills(db, bills, member_id, relationship):
                                                                                                     update_date = EXCLUDED.update_date,
                                                                                                     row_hash = EXCLUDED.row_hash,
                                                                                                     ingested_at = EXCLUDED.ingested_at
-                                                                                                WHERE main.raw_bills.row_hash != EXCLUDED.row_hash \
+                                                                                                {_changed_only("main.raw_bills.row_hash != EXCLUDED.row_hash")}
                  """
 
     db.executemany(upsert_sql, rows)
@@ -385,7 +400,7 @@ def load_amendments(db, amendments, congress, bill_type, bill_number):
             description, purpose, sponsor_id, update_date, row_hash, now_iso
         ))
 
-    db.executemany("""
+    db.executemany(f"""
         INSERT INTO main.raw_amendments (
             congress, bill_type, bill_number, amendment_number, amendment_type,
             description, purpose, sponsor_id, update_date, row_hash, ingested_at
@@ -398,5 +413,5 @@ def load_amendments(db, amendments, congress, bill_type, bill_number):
             update_date = EXCLUDED.update_date,
             row_hash = EXCLUDED.row_hash,
             ingested_at = EXCLUDED.ingested_at
-        WHERE main.raw_amendments.row_hash != EXCLUDED.row_hash
+        {_changed_only("main.raw_amendments.row_hash != EXCLUDED.row_hash")}
     """, rows)

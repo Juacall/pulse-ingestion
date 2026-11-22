@@ -36,6 +36,7 @@ from database import (
 )
 from ingest_amendments import ingest_bill_amendments, _ingest_bill_amendments_async
 from ingest_members import ingest_members
+from ingestion import set_force_rewrite
 from ingest_bills import ingest_member_bills
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,7 @@ def prompt_refresh_mode() -> bool:
     """Prompt the user to specify whether this is a full refresh or incremental refresh."""
     print("\nSelect refresh mode:")
     print("  1) Incremental refresh (preserve existing data, skip unchanged records)")
-    print("  2) Full refresh (reset/recreate raw tables)")
+    print("  2) Full refresh (keep tables, re-pull and rewrite every record without hash checks)")
 
     while True:
         choice = input("Is this a full refresh or incremental refresh? (1=incremental, 2=full, or i/f): ").strip().lower()
@@ -64,7 +65,7 @@ def prompt_refresh_mode() -> bool:
             print("Selected: Incremental refresh\n")
             return False
         elif choice in ("2", "f", "full", "y", "yes"):
-            print("Selected: Full refresh (tables will be reset)\n")
+            print("Selected: Full refresh (all records re-pulled; tables kept)\n")
             return True
         print("Invalid choice. Please enter '1'/'i' for Incremental or '2'/'f' for Full refresh.")
 
@@ -124,24 +125,15 @@ def setup_database(
         reset: bool | None = None,
         reset_tables: list[str] | None = None,
 ):
-    """Initialize database tables."""
-    if reset is None:
-        should_reset = prompt_refresh_mode()
-    else:
-        should_reset = reset
+    """Initialize database tables. A full refresh keeps the tables and skips hash comparison."""
+    should_reset = bool(reset)  # incremental unless --reset is passed
 
+    set_force_rewrite(should_reset)
     if should_reset:
-        tables = reset_tables if reset_tables is not None else [
-            "raw_members", "raw_bills", "raw_amendments"
-        ]
-        if tables:
-            print(f"Recreating raw table(s) (full refresh mode): {', '.join(tables)}...")
-        else:
-            print("Full refresh selected, but this task does not ingest into a raw table.")
-        create_tables(db, replace=True, replace_tables=tables)
+        print("Full refresh: keeping existing tables and rewriting all records (hash checks skipped)...")
     else:
         print("Ensuring raw tables exist (incremental/preserve mode)...")
-        create_tables(db, replace=False)
+    create_tables(db, replace=False)
     return should_reset
 
 
@@ -341,16 +333,28 @@ def run_standalone_pipeline(name: str, args=None):
         from ingest_running_candidates import ingest_candidates
         ingest_candidates()
     elif name == "fec":
-        from ingest_donate_details import run_fec_ingestion
-        run_fec_ingestion(
-            mode=getattr(args, "fec", None) or "both",
-            force=getattr(args, "force", False),
-        )
+        from ingest_donor_detail_bulk import run_bulk_ingestion
+        run_bulk_ingestion()
     elif name == "motherduck":
         from sync_motherduck import sync_motherduck
         sync_motherduck()
     else:
         raise ValueError(f"Unknown pipeline: {name}")
+
+
+def run_standalone_and_publish(name: str, args):
+    """Run a standalone pipeline, then rebuild dbt, record its watermark, sync, and invalidate caches."""
+    publish = name != "motherduck" and not getattr(args, "no_publish", False)
+    previous = None
+    if publish:
+        from post_ingest import read_watermarks
+        previous = read_watermarks([name])
+
+    run_standalone_pipeline(name, args)
+
+    if publish:
+        from post_ingest import refresh_after_ingest
+        refresh_after_ingest([name], previous)
 
 
 def start_pipeline(args):
@@ -368,7 +372,7 @@ def start_pipeline(args):
         None,
     )
     if standalone:
-        run_standalone_pipeline(standalone, args)
+        run_standalone_and_publish(standalone, args)
         return
 
     has_explicit_cli_flags = any([
@@ -388,14 +392,11 @@ def start_pipeline(args):
         if selection is None:
             return
         if "pipeline" in selection:
-            run_standalone_pipeline(selection["pipeline"], args)
+            run_standalone_and_publish(selection["pipeline"], args)
             return
         chamber = selection["chamber"]
         ingestion_mode = selection["ingestion_mode"]
         skip_members = selection["skip_members"]
-
-        if reset is None:
-            reset = prompt_refresh_mode()
 
     else:
         chamber = DEFAULT_CHAMBER
@@ -419,6 +420,20 @@ def start_pipeline(args):
     members_only = ingestion_mode == "members"
     ingest_bills = ingestion_mode in ("bills", "all")
     ingest_amendments = ingestion_mode in ("amendments", "all")
+
+    publish = not getattr(args, "no_publish", False)
+    refreshed = []
+    if not skip_members and ingestion_mode in ("members", "all"):
+        refreshed.append("members")
+    if ingest_bills:
+        refreshed.append("bills")
+    if ingest_amendments:
+        refreshed.append("amendments")
+
+    previous_watermarks = None
+    if publish and refreshed:
+        from post_ingest import read_watermarks
+        previous_watermarks = read_watermarks(refreshed)
 
     db = get_db_connection()
 
@@ -445,4 +460,11 @@ def start_pipeline(args):
     )
 
     db.close()
-    print("\nDone. Run `uv run dbt build` from the dbt/ directory.")
+
+    if not publish:
+        print("\nSkipped dbt build, MotherDuck sync, and cache invalidation (--no-publish).")
+        return
+
+    if refreshed:
+        from post_ingest import refresh_after_ingest
+        refresh_after_ingest(refreshed, previous_watermarks)

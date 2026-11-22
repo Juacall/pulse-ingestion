@@ -29,6 +29,50 @@ Re-run the last two commands whenever ingestion runs again to refresh the marts.
 
 Step 8 takes roughly 10 minutes with the inherited defaults (the script makes ~800 API calls). Step 9 is sub-second.
 
+### Run the end-to-end job (`prod_job.py`)
+
+`scripts/prod_job.py` is the non-interactive job used on Cloud Run. One run does:
+read the pipeline watermark → (prod only) pull the needed tables from MotherDuck
+→ run the ingestion → if there are updates, run `dbt build` for the affected
+models, sync MotherDuck, write the watermark, and invalidate API caches. If
+nothing changed it exits 0 without touching MotherDuck or the caches.
+
+```powershell
+uv run python scripts/prod_job.py --pipeline members --chamber both
+uv run python scripts/prod_job.py --pipeline bills --chamber senate
+uv run python scripts/prod_job.py --pipeline amendments
+```
+
+| Argument | Values | Default |
+|---|---|---|
+| `--pipeline` | `members`, `bills`, `amendments`, `candidates`, `elections`, `votes`, `fec` | `PIPELINE` env var (required if unset) |
+| `--chamber` | `house`, `senate`, `both` (members/bills/amendments only) | `CHAMBER` env var, else `house` |
+
+Run `members` before `bills`, and `bills` before `amendments`; each reads the
+previous stage's raw table. Runs are incremental: unchanged rows are skipped by
+row hash and only changes past the stored watermark trigger a rebuild and sync.
+
+**Environment** (`.env` locally, secrets/env vars on Cloud Run):
+
+| Variable | Needed | Purpose |
+|---|---|---|
+| `ENV` | always | `dev` or `prod` |
+| `MOTHERDUCK_TOKEN` | always | MotherDuck access |
+| `INTERNAL_API_SECRET` | always | Cache invalidation auth |
+| `DEV_SERVER_URL` / `PROD_SERVER_URL` | dev / prod | API whose cache is invalidated |
+| `CONGRESS_API_KEY`, `FEC_API_KEY` | per pipeline | Source APIs |
+| `DBT_THREADS` | optional | dbt threads (default 1) |
+
+**Dev vs prod:** with `ENV=dev` the job skips the MotherDuck pull, uses the local
+`dev.duckdb`, builds the downstream dbt models, and syncs to `pulse_dev` (the
+watermark is stored locally). With `ENV=prod` it starts from an empty local
+database, hydrates only the tables it needs from `pulse_prod`, and syncs back.
+Close any other tool holding `dev.duckdb` (e.g. an IDE database connection)
+before running, since DuckDB allows one writer.
+
+To force a rebuild and sync when the job reports "No updates detected", delete
+that pipeline's row from `etl_watermarks` (e.g. `congress_members`).
+
 ### Run ingestion stages separately
 
 The interactive ingestion menu offers separate House/Senate bills-only and
@@ -40,8 +84,9 @@ uv run scripts/main.py --house --bills-only --skip-members
 uv run scripts/main.py --house --amendments-only
 ```
 
-Use `--reset` with either command to fully refresh only the selected destination
-table. Amendments-only runs require bills to have already been ingested.
+Ingestion via `main.py` is incremental by default (no prompt). Use `--reset` for a
+full refresh: tables are kept, but every record is re-pulled and rewritten without
+row-hash checks. Amendments-only runs require bills to have already been ingested.
 The pipeline stages are also callable independently from `scripts.pipeline`:
 `ingest_members(...)`, `ingest_member_bills(db, members, ...)`, and
 `ingest_bill_amendments(db, bills, ...)`.
